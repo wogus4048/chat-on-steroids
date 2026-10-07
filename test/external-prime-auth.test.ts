@@ -104,10 +104,10 @@ describe('seven strict external tool contracts', () => {
   });
   it('validates operation-specific success and strict error envelopes', () => {
     const successes = {
-      workers_status: { families: [{ family_id: id, run_id: id, workers: [{ worker_id: 'worker-1', status: 'active' }] }] },
+      workers_status: { families: [{ family_id: id, run_id: id, workers: [{ worker_id: 'worker-1', status: 'active' }] }], next_cursor: null },
       workers_spawn: { request_id: id, family_id: id, worker_id: 'worker-1', run_id: id, status: 'accepted' },
       workers_message: { request_id: id, family_id: id, worker_id: 'worker-1', status: 'accepted' },
-      workers_reports: { reports: [{ report_id: id, revision: 1, worker_id: 'worker-1', summary: 'Done', delivery_receipt_id: id }], next_cursor: null },
+      workers_reports: { reports: [{ report_id: id, revision: 1, worker_id: 'worker-1', summary: 'Done', summary_truncated: false, delivery_receipt_id: id }], next_cursor: null },
       workers_ack: { request_id: id, family_id: id, acknowledged: [id], status: 'settled' },
       workers_result: { result_id: id, text: 'a', offset: 0, next_offset: 1, eof: true, total_bytes: 1, sha256: 'a'.repeat(64) },
       workers_stop: { request_id: id, family_id: id, worker_id: 'worker-1', status: 'accepted', admission: 'blocked', browser: 'unknown', processes: 'running' }
@@ -129,7 +129,7 @@ describe('wire boundary compatibility', () => {
     expect(externalToolSchemas.workers_spawn.safeParse({ ...wireInputs.workers_spawn, workspace_root_id: 'a'.repeat(33) }).success).toBe(false);
   });
   it('rejects response page text beyond aggregate budget and invalid stop evidence', () => {
-    const reports = Array.from({ length: 9 }, () => ({ report_id: id, revision: 1, worker_id: 'worker-1', summary: 'x'.repeat(4000), delivery_receipt_id: id }));
+    const reports = Array.from({ length: 9 }, () => ({ report_id: id, revision: 1, worker_id: 'worker-1', summary: 'x'.repeat(4000), summary_truncated: false, delivery_receipt_id: id }));
     expect(externalResponseSchemas.workers_reports.safeParse({ ok: true, data: { reports, next_cursor: null } }).success).toBe(false);
     expect(externalResponseSchemas.workers_stop.safeParse({ ok: true, data: { request_id: id, family_id: id, worker_id: 'worker-1', status: 'accepted', admission: 'allowed', browser: 'stopped', processes: 'settled' } }).success).toBe(false);
   });

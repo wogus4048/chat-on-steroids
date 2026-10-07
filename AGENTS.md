@@ -2992,6 +2992,25 @@ available when the last worker sleeps and the family parks. Prime-to-prime messa
 same staged durability barrier; the sender's run address is durable routing metadata, and a
 foreign `target_run_id` never widens the recipient to its workers.
 
+The external-prime service uses the same broker acceptance lane and browser bootstrap/revival
+hooks. External mutation UUIDs retain their exact receipt across family disposal; replay never
+creates another worker or republishes browser work. Status is a stored broker projection, not a
+fresh session context measurement: it pages the complete owned topology (50 workers by default,
+100 maximum), with a cursor bound to principal, family selector and membership. Lifecycle and
+incarnation changes alone do not invalidate that cursor. Message admission reuses Core's durable
+sleeping-worker context measurement before wake; ordinary sleep does not require `resume:true`.
+
+External reports project all pending worker-to-prime inbox rows. Existing short message ids
+remain intact; the same row gains a durable external UUID/revision and reusable delivery receipt.
+Reading never acknowledges it. Only an explicit, atomically validated ACK batch retires those
+exact report revisions. Metadata and ACK stages are speculative overlays in the broker's exact
+snapshot and remain invisible before commit. Restore quarantines malformed or duplicate report
+authority and incoherent delivery/ACK metadata. Report pages retain the 10/20-row and 32,000-character
+limits; both external list envelopes additionally fit 64 KiB of UTF-8 JSON including escaping.
+Long summaries carry an explicit shortening flag/marker within 4,000 characters; original inbox
+text is preserved, and a summary does not promise result-file retrieval. Report cursors become
+stale when their pending sequence/revisions change and require an explicit restart.
+
 Attached and detached workers share `WORKER_SILENCE_MS` (three minutes). Only accepted new
 assistant output, native work or exactly attributed tool activity renews this clock. Page
 presence, reloads, metadata revisions and replayed starts do not. A currently running tool

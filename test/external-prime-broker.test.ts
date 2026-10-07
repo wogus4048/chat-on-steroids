@@ -312,6 +312,7 @@ it('restores ACK and stop receipt payloads and inbox/worker metadata without rec
   const worker = snapshot.activeRuns![0]!.agents.find(row => row.info.id === 'worker-1')!;
   worker.info.externalStopIntent = { id: stopId, ownerRevision: a.policyRevision, runId: spawned.runId, conversationId: 'metadata-worker', turnId: 'turn-exact', createdAt: Date.now() };
   const report = snapshot.activeRuns![0]!.agents.find(row => row.info.id === 'prime')!.queue[0]!;
+  report.externalReport = { id: reportIdSchema.parse(crypto.randomUUID()), revision: 3 };
   report.externalDelivery = { id: receiptIdSchema.parse(crypto.randomUUID()), revision: 3, deliveredAt: Date.now() };
   broker.restoreSwarm(snapshot);
   expect(broker.getExternalReceipt(a, ackId)).toEqual(ack);

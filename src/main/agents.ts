@@ -16,8 +16,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { AgentOwner, Caller, ChatGptCaller, ExternalCaller, FamilyId, RequestId } from '../shared/agent-owner.js';
-import { agentOwnerSchema, familyIdSchema, principalIdSchema, requestIdSchema, receiptIdSchema } from '../shared/agent-owner.js';
-import { EXTERNAL_PRIME_LIMITS, externalMutationReceiptSchema, browserBindingSchema, workspaceRootIdSchema, setupProfileIdSchema, type ExternalMutationReceipt } from '../shared/external-prime.js';
+import { agentOwnerSchema, familyIdSchema, principalIdSchema, requestIdSchema, receiptIdSchema, reportIdSchema } from '../shared/agent-owner.js';
+import { EXTERNAL_PRIME_LIMITS, externalMutationReceiptSchema, browserBindingSchema, workspaceRootIdSchema, setupProfileIdSchema, type ExternalMutationReceipt, type StatusArgs, type StatusResult, type ReportQuery, type ReportPage, type AckArgs, type AckReceipt } from '../shared/external-prime.js';
 import { isExternalCallerAuthenticated, ExternalPrimeError } from './external-prime-auth.js';
 export type { Caller } from '../shared/agent-owner.js';
 import type { AgentInfo, AgentMessage, AgentState, ReasoningEffort, SwarmState } from '../shared/session.js';
@@ -432,11 +432,14 @@ interface FinishStageState {
   settled: boolean;
 }
 const activeFinishStages = new Map<Agent, FinishStageState>();
+/** Speculative inbox projection, owned by the existing acceptance lane. Never a delivery queue. */
+const externalInboxProposals = new Map<AgentMessage, AgentMessage>();
 
 export interface StagedMutation<T> { value: T; commit(): void | boolean; rollback(): void }
 export interface MutationReceipt<T> { value: T; replayed: boolean }
 const externalStopIntentSchema = z.object({ id: requestIdSchema, ownerRevision: z.number().int().positive(),
   runId: z.string().uuid(), conversationId: z.string().min(1).max(256), turnId: z.string().min(1).max(256).optional(), createdAt: z.number().finite().nonnegative() }).strict();
+const externalReportSchema = z.object({ id: reportIdSchema, revision: z.number().int().positive() }).strict();
 const externalReportDeliverySchema = z.object({ id: receiptIdSchema, revision: z.number().int().positive(),
   deliveredAt: z.number().finite().nonnegative(), ackedAt: z.number().finite().nonnegative().optional() }).strict();
 
@@ -945,6 +948,135 @@ export function resolveExternalFamily(caller: ExternalCaller, familyId: FamilyId
   return { familyId: family.familyId, runId: familyKey(family), owner: { ...family.owner }, placement: family.externalPlacement ? structuredClone(family.externalPlacement) : undefined };
 }
 
+function externalCursor(kind: string, caller: ExternalCaller, selector: string | null, fingerprint: string, position: number): string {
+  return Buffer.from(JSON.stringify({ kind, principal: caller.principalId, selector, fingerprint, position })).toString('base64url');
+}
+function cursorPosition(cursor: string | undefined, kind: string, caller: ExternalCaller, selector: string | null, fingerprint: string, size: number): number {
+  if (!cursor) return 0;
+  let value: unknown;
+  try { value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')); } catch { /* refused below */ }
+  const parsed = z.object({ kind: z.literal(kind), principal: z.literal(caller.principalId), selector: z.literal(selector), fingerprint: z.literal(fingerprint), position: z.number().int().positive().max(size - 1) }).strict().safeParse(value);
+  if (!parsed.success || externalCursor(kind, caller, selector, fingerprint, parsed.data.position) !== cursor) throw new ExternalPrimeError('INVALID_ARGUMENT', 'Cursor is invalid or stale; restart the list');
+  return parsed.data.position;
+}
+function fingerprintOf(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
+function fitsExternalList(value: unknown): boolean {
+  return Buffer.byteLength(JSON.stringify({ ok: true, data: value }), 'utf8') <= EXTERNAL_PRIME_LIMITS.listEnvelopeBytes;
+}
+
+/** Bounded projection of the existing broker topology. A cursor never supplies ownership. */
+export function externalStatus(caller: ExternalCaller, args: StatusArgs): StatusResult {
+  requireExternalCaller(caller);
+  if (args.request_id) {
+    const receipt = getExternalReceipt(caller, args.request_id);
+    if (!receipt) throw new ExternalPrimeError('NOT_FOUND', 'Request receipt unavailable');
+    return receipt;
+  }
+  const families = (args.family_id ? [externalFamily(caller, args.family_id)] : familiesForCaller(caller)).sort((a, b) => a.familyId.localeCompare(b.familyId));
+  const rows = families.flatMap<{ family: Family; agent: Agent | null }>(family => {
+    const workers = [...family.agents.values()].filter(agent => agent.info.role === 'worker' && !unpublishedAgents.has(agent)).sort((a, b) => a.info.id.localeCompare(b.info.id));
+    return workers.length ? workers.map(agent => ({ family, agent })) : [{ family, agent: null }];
+  });
+  const fingerprint = fingerprintOf(rows.map(row => [row.family.familyId, row.agent?.info.id ?? null]));
+  const selector = args.family_id ?? null;
+  const start = cursorPosition(args.cursor, 'status', caller, selector, fingerprint, rows.length);
+  const page: Extract<StatusResult, { families: unknown }> = { families: [], next_cursor: null };
+  const limit = args.limit ?? EXTERNAL_PRIME_LIMITS.statusDefault;
+  let index = start;
+  for (; index < rows.length && index - start < limit; index++) {
+    const row = rows[index]!;
+    const prior = page.families.at(-1);
+    if (prior?.family_id !== row.family.familyId && page.families.length >= EXTERNAL_PRIME_LIMITS.familiesPerPrincipal) break;
+    const entry: Extract<StatusResult, { families: unknown }>['families'][number] = prior && prior.family_id === row.family.familyId ? prior : { family_id: row.family.familyId, run_id: familyKey(row.family), workers: [] };
+    if (entry !== prior) page.families.push(entry);
+    if (row.agent) entry.workers.push({ worker_id: row.agent.info.id, status: row.agent.info.state, conversation_id: row.agent.info.conversationId });
+    page.next_cursor = index + 1 < rows.length ? externalCursor('status', caller, selector, fingerprint, index + 1) : null;
+    if (!fitsExternalList(page)) {
+      if (row.agent) entry.workers.pop();
+      if (entry !== prior) page.families.pop();
+      break;
+    }
+  }
+  page.next_cursor = index < rows.length ? externalCursor('status', caller, selector, fingerprint, index) : null;
+  if (index === start && rows.length) throw new ExternalPrimeError('CAPACITY_EXCEEDED', 'A status row exceeds the response limit');
+  return page;
+}
+
+function externalReportRows(family: Family): AgentMessage[] {
+  return family.agents.get(PRIME_ID)!.queue.filter(message => message.ackedAt === null && !unpublishedMessages.has(message) && message.to === PRIME_ID && family.agents.get(message.from)?.info.role === 'worker');
+}
+function reportSummary(text: string): { summary: string; summary_truncated: boolean } {
+  if (text.length <= MAX_MESSAGE_CHARS) return { summary: text, summary_truncated: false };
+  const marker = '\n[Summary shortened; original inbox text retained.]';
+  let end = MAX_MESSAGE_CHARS - marker.length;
+  if (/[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+  return { summary: text.slice(0, end) + marker, summary_truncated: true };
+}
+/** All metadata and ACK proposals serialize with the existing exact snapshot. */
+function stageExternalInbox<T>(family: Family, proposals: Map<AgentMessage, AgentMessage>, value: T): StagedMutation<T> {
+  for (const [original, proposal] of proposals) externalInboxProposals.set(original, proposal);
+  if (proposals.size) changed();
+  let settled = false;
+  return { value, commit: () => {
+    if (settled) return; settled = true;
+    const prime = family.agents.get(PRIME_ID)!;
+    if (!allFamilies().includes(family) || [...proposals.keys()].some(row => !prime.queue.includes(row))) return false;
+    for (const [original, proposal] of proposals) {
+      if (original.ackedAt === null && proposal.ackedAt !== null) prime.info.delivered++;
+      Object.assign(original, proposal); externalInboxProposals.delete(original);
+    }
+    recount(prime); changed('telemetry');
+  }, rollback: () => {
+    if (settled) return; settled = true;
+    for (const original of proposals.keys()) externalInboxProposals.delete(original);
+  } };
+}
+
+export function stageExternalReports(caller: ExternalCaller, args: ReportQuery): StagedMutation<ReportPage> {
+  const family = externalFamily(caller, args.family_id);
+  const rows = externalReportRows(family);
+  // UUID migration must not stale the cursor that this same page issues.
+  const fingerprint = fingerprintOf(rows.map(row => [row.id, row.externalReport?.revision ?? 1, fingerprintOf(row.text)]));
+  const start = cursorPosition(args.cursor, 'reports', caller, args.family_id, fingerprint, rows.length);
+  const page: ReportPage = { reports: [], next_cursor: null };
+  const proposals = new Map<AgentMessage, AgentMessage>();
+  let chars = 0, index = start;
+  for (; index < rows.length && index - start < args.limit; index++) {
+    const original = rows[index]!;
+    const report = original.externalReport ?? { id: reportIdSchema.parse(randomUUID()), revision: 1 };
+    if (original.externalDelivery && original.externalDelivery.revision !== report.revision) throw new ExternalPrimeError('PERSISTENCE_FAILED', 'Report identity requires local recovery');
+    const delivery = original.externalDelivery ?? { id: receiptIdSchema.parse(randomUUID()), revision: report.revision, deliveredAt: Date.now() };
+    const summary = reportSummary(original.text);
+    const item: ReportPage['reports'][number] = { report_id: report.id, revision: report.revision, worker_id: original.from, ...summary, delivery_receipt_id: delivery.id };
+    if (chars + summary.summary.length > EXTERNAL_PRIME_LIMITS.reportsTextChars) break;
+    page.reports.push(item);
+    page.next_cursor = index + 1 < rows.length ? externalCursor('reports', caller, args.family_id, fingerprint, index + 1) : null;
+    if (!fitsExternalList(page)) { page.reports.pop(); break; }
+    chars += summary.summary.length;
+    if (!original.externalReport || !original.externalDelivery) proposals.set(original, { ...original, externalReport: report, externalDelivery: delivery });
+  }
+  page.next_cursor = index < rows.length ? externalCursor('reports', caller, args.family_id, fingerprint, index) : null;
+  if (index === start && rows.length) throw new ExternalPrimeError('CAPACITY_EXCEEDED', 'A report exceeds the response limit');
+  return stageExternalInbox(family, proposals, page);
+}
+
+export function stageExternalAck(caller: ExternalCaller, args: AckArgs): StagedMutation<AckReceipt> {
+  const family = externalFamily(caller, args.family_id);
+  const queue = family.agents.get(PRIME_ID)!.queue;
+  const proposals = new Map<AgentMessage, AgentMessage>();
+  const acknowledged: AckReceipt['acknowledged'] = [];
+  for (const input of args.receipts) {
+    const row = queue.find(message => message.externalReport?.id === input.report_id);
+    if (!row || row.externalReport!.revision !== input.revision || row.externalDelivery?.revision !== input.revision || row.externalDelivery.id !== input.delivery_receipt_id) throw new ExternalPrimeError('INVALID_ARGUMENT', 'Report receipt unavailable or revision does not match');
+    if (!acknowledged.includes(input.report_id)) acknowledged.push(input.report_id);
+    if (row.ackedAt === null) {
+      const now = Date.now();
+      proposals.set(row, { ...row, ackedAt: now, externalDelivery: { ...row.externalDelivery, ackedAt: now } });
+    }
+  }
+  return stageExternalInbox(family, proposals, { request_id: args.request_id, family_id: args.family_id, acknowledged, status: 'accepted' });
+}
+
 function selectedFamily(input: Caller, includeUnpublished = false): Family | null {
   const owned = familiesForCaller(input, includeUnpublished);
   if (chatCaller(input)?.runId) return owned.find(owner => familyKey(owner) === chatCaller(input)?.runId) ?? owned.find(owner => answersTo(owner, chatCaller(input)?.runId!)) ?? null;
@@ -1399,6 +1531,33 @@ export function swarmStateForCaller(caller: Caller): SwarmState {
   return { enabled: true, running: owned.some(owner => 'runId' in owner),
     retainedHistory: owned.some(owner => !('runId' in owner)),
     agents: owned.flatMap(owner => stateForAgents(owner.agents, 'runId' in owner).agents) };
+}
+
+/** Session reads happen outside the broker lane; only their checked publication enters it. */
+export async function measureSleepingWorkers(caller: Caller): Promise<void> {
+  const state = swarmStateForCaller(caller);
+  if (state.agents.length === 0) return;
+  for (const info of state.agents) {
+    if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
+    const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
+    if (summary) await mutateSwarm(() => {
+      if (caller.kind === 'external_principal') requireExternalCaller(caller);
+      noteAgentContextTokens(info.conversationId, summary.contextTokens);
+    });
+  }
+  // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
+  // authority and can terminalize a parked worker. `status` also calls this helper, so there is
+  // no later message/spawn acceptance barrier we can rely on: make every critical revision seen
+  // through the end of measurement durable before publishing the resulting state to the model.
+  try {
+    if (!(await persistCriticalSwarmNow())) {
+      throw new Error('the broker has no immediate durable persistence sink');
+    }
+  } catch (error) {
+    throw new Error(
+      `Worker context/revival state could not cross its durable barrier. Retry the agents call. (${error instanceof Error ? error.message : String(error)})`
+    );
+  }
 }
 
 export interface CallerSwarmStatus {
@@ -2843,6 +3002,7 @@ export function offerMessagesForCaller(
   input: Caller, onFinish = false, allowDormantWorkerFinishRetry = false
 ): { agentId: string; messages: Array<AgentMessage & { runId?: string }> } | null {
   const caller = exactCaller(input);
+  if (caller.kind === 'external_principal') return null;
   const owned = familiesForCaller(caller).filter(owner => ownsPrime(caller, owner) && (!chatCaller(caller)?.runId || answersTo(owner, chatCaller(caller)?.runId!)));
   if (owned.length) {
     let budget = MAX_INBOX_OFFER_CHARS;
@@ -2931,6 +3091,7 @@ export function acknowledgeOffersForCaller(
   input: Caller, byFinish = false, callStartedAt = Number.POSITIVE_INFINITY, allowDormantWorkerFinishRetry = false
 ): { agentId: string; messages: AgentMessage[] } | null {
   const caller = exactCaller(input);
+  if (caller.kind === 'external_principal') return null;
   const owned = familiesForCaller(caller).filter(owner => ownsPrime(caller, owner) && (!chatCaller(caller)?.runId || answersTo(owner, chatCaller(caller)?.runId!)));
   if (owned.length) return { agentId: PRIME_ID, messages: owned.flatMap(owner =>
     acknowledgeAgentOffers(owner.agents.get(PRIME_ID)!, byFinish, callStartedAt)) };
@@ -5133,17 +5294,20 @@ function serializeAgents(agents: Map<string, Agent>, includeUnpublished: boolean
         ).length;
         info.delivered += newlyDelivered;
       }
-      const queue = agent.queue
+      const projected = agent.queue.map(message => includeUnpublished ? externalInboxProposals.get(message) ?? message : message);
+      const newlyAcknowledged = includeUnpublished ? projected.filter((message, index) => agent.queue[index]!.ackedAt === null && message.ackedAt !== null).length : 0;
+      info.delivered += newlyAcknowledged;
+      const queue = projected
         .filter(
           (message) =>
-            message.ackedAt === null &&
+            (message.ackedAt === null || message.externalReport !== undefined) &&
             (!finishAcknowledged || !finishAcknowledged.has(message.id)) &&
             (includeUnpublished || !unpublishedMessages.has(message))
         )
         .map((message) => ({ ...message }));
-      if (finishAcknowledged) {
-        info.pending = queue.length;
-        info.awaitingAck = queue.filter((message) => message.offeredAt !== null).length;
+      if (finishAcknowledged || newlyAcknowledged) {
+        info.pending = queue.filter(message => message.ackedAt === null).length;
+        info.awaitingAck = queue.filter((message) => message.ackedAt === null && message.offeredAt !== null).length;
       }
       if (includeUnpublished && agent.info.id === PRIME_ID) {
         queue.push(...stagedFinishes.map((stage) => ({ ...stage.report })));
@@ -5192,6 +5356,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
   unpublishedRuns.clear();
   activeSpawnStages.clear();
   activeFinishStages.clear();
+  externalInboxProposals.clear();
   externalLedgers.clear();
   unpublishedExternalRecords.clear();
   quarantinedExternalLedgers.clear();
@@ -5229,7 +5394,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
           const parsed = externalLedgerRecordSchema.safeParse(raw);
           if (!parsed.success || Buffer.byteLength(JSON.stringify(raw)) > 2048) { quarantinedExternalLedgers.add(ledger.principalId); continue; }
           const record = parsed.data;
-          if (record.requestId !== record.receipt.receipt.request_id || record.operation !== record.receipt.operation || record.familyId !== record.receipt.receipt.family_id || records.has(record.requestId)) {
+          if (record.requestId !== record.receipt.receipt.request_id || record.operation !== record.receipt.operation || record.familyId !== record.receipt.receipt.family_id || record.status !== record.receipt.receipt.status || ('worker_id' in record.receipt.receipt && record.workerId !== record.receipt.receipt.worker_id) || records.has(record.requestId)) {
             quarantinedExternalLedgers.add(ledger.principalId); continue;
           }
           records.set(record.requestId, record);
@@ -5266,6 +5431,40 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
   const occupiedRequests = new Set<string>();
   const validRequestOwner = (value: unknown): value is string =>
     typeof value === 'string' && /^[a-z0-9_-]{1,100}$/i.test(value);
+  const restoredReportIds = new Map<string, Set<string>>();
+  const restoredDeliveryIds = new Map<string, Set<string>>();
+  // Validate external inbox identity once per saved family, before lossy normalization.
+  for (const saved of snapshot.version === 8 ? [...snapshot.activeRuns!, ...snapshot.dormantRuns!] : []) {
+    const parsed = agentOwnerSchema.safeParse(saved.owner);
+    if (!parsed.success || parsed.data.kind !== 'external_principal') continue;
+    const owner = parsed.data;
+      const reportIds = restoredReportIds.get(owner.principalId) ?? new Set<string>();
+      const deliveryIds = restoredDeliveryIds.get(owner.principalId) ?? new Set<string>();
+      restoredReportIds.set(owner.principalId, reportIds); restoredDeliveryIds.set(owner.principalId, deliveryIds);
+      const rows = saved.agents?.flatMap(agent => agent.queue ?? []) ?? [];
+      let corrupt = saved.agents?.some(agent => agent.info?.externalStopIntent !== undefined && !externalStopIntentSchema.safeParse(agent.info.externalStopIntent).success) ?? false;
+      for (const message of rows) {
+        const report = message.externalReport;
+        const delivery = message.externalDelivery;
+        if (report !== undefined && (!externalReportSchema.safeParse(report).success || reportIds.has(report.id))) corrupt = true;
+        if (report) reportIds.add(report.id);
+        if (delivery !== undefined && (!externalReportDeliverySchema.safeParse(delivery).success || !report || delivery.revision !== report.revision || deliveryIds.has(delivery.id) ||
+            (delivery.ackedAt !== undefined) !== (message.ackedAt !== null))) corrupt = true;
+        if (delivery) deliveryIds.add(delivery.id);
+      }
+      for (const record of externalLedgers.get(owner.principalId)?.values() ?? []) {
+        if (record.familyId === saved.familyId && record.deletedAt !== undefined) corrupt = true;
+        if (record.receipt.operation !== 'workers_ack' || record.deletedAt || record.familyId !== (saved as { familyId?: FamilyId }).familyId) continue;
+        for (const id of record.receipt.receipt.acknowledged) {
+          const row = rows.find(message => message.externalReport?.id === id);
+          if (row && (!row.externalDelivery?.ackedAt || row.ackedAt === null)) corrupt = true;
+        }
+      }
+      if (corrupt) {
+        quarantinedExternalLedgers.add(owner.principalId);
+        if (!externalLedgers.has(owner.principalId)) externalLedgers.set(owner.principalId, new Map());
+      }
+  }
   const restoredOwner = (saved: { owner?: AgentOwner; primeConversationId: string | null; primeRequestId?: string; agents?: SerializedAgent[] }): AgentOwner | null => {
     if (snapshot.version < 8) return saved.primeConversationId
       ? { kind: 'chatgpt_conversation', conversationId: saved.primeConversationId }
@@ -5274,11 +5473,6 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
     if (!parsed.success) return null;
     const owner = parsed.data;
     if (owner.kind === 'external_principal') {
-      if (saved.agents?.some(agent => (agent.info?.externalStopIntent !== undefined && !externalStopIntentSchema.safeParse(agent.info.externalStopIntent).success) ||
-          agent.queue?.some(message => message.externalDelivery !== undefined && !externalReportDeliverySchema.safeParse(message.externalDelivery).success))) {
-        quarantinedExternalLedgers.add(owner.principalId);
-        if (!externalLedgers.has(owner.principalId)) externalLedgers.set(owner.principalId, new Map());
-      }
       return saved.primeConversationId === null && !saved.primeRequestId ? owner : null;
     }
     if (owner.kind === 'chatgpt_conversation') return owner.conversationId === saved.primeConversationId ? owner : null;
@@ -5543,6 +5737,7 @@ export function resetAgentsForTests(): void {
   unpublishedRuns.clear();
   activeSpawnStages.clear();
   activeFinishStages.clear();
+  externalInboxProposals.clear();
   retiredWorkers.clear();
   livenessFloor = 0;
   spawnRequest = null;

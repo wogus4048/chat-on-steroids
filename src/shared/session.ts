@@ -6,7 +6,7 @@
  * agree on exactly.
  */
 
-import type { AgentOwner, FamilyId, RequestId, ReceiptId } from './agent-owner.js';
+import type { AgentOwner, FamilyId, RequestId, ReceiptId, ReportId } from './agent-owner.js';
 
 /** Where an event came from. The extension is untrusted UI observation; mcp is ours. */
 export type EventSource = 'extension' | 'mcp' | 'app';
@@ -1036,6 +1036,7 @@ export interface AgentInfo {
  * one place where that is unrecoverable rather than merely annoying.
  */
 export interface AgentMessage {
+  externalReport?: { id: ReportId; revision: number };
   externalDelivery?: ExternalReportDelivery;
   id: string;
   from: string;

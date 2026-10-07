@@ -111,8 +111,7 @@ import {
   agentForCaller,
   agentFamiliesForCaller,
   reconcileAgentRequestOwners,
-  noteAgentContextTokens,
-  persistCriticalSwarmNow,
+  measureSleepingWorkers,
   PRIME_ID,
   requestWorkerBootstraps,
   requestWorkerRevivals,
@@ -122,10 +121,7 @@ import {
   stagePrimeMessage,
   stageSpawn,
   acceptStagedSwarmMutation,
-  mutateSwarm,
-  swarmRunning,
-  swarmStateForCaller,
-  type Caller
+  swarmRunning
 } from '../agents.js';
 import { repairPrimeFromResumeShadow } from '../session/continuation.js';
 import {
@@ -1161,40 +1157,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
  * act on and is kept to a sentence or two; ids, states and counts are machine state and belong
  * in a shape the caller can read without parsing English.
  */
-/**
- * Re-measures how full each sleeping worker's chat is, before the prime may wake one.
- *
- * The context ceiling is what makes a stop final, and it is measured from the app's own
- * durable session for that conversation rather than from anything a model reported. The
- * broker keeps the figure in memory and in its snapshot, but a chat that grew while this app
- * was not running — or one whose snapshot predates the measurement entirely — would otherwise
- * be woken into a conversation with no room left in it. Reading it here, on the one call that
- * can wake a worker, is what makes the ceiling survive a crash rather than a restart quietly
- * handing back a worker the prime was already told was finished.
- */
-async function measureSleepingWorkers(caller: Caller): Promise<void> {
-  const state = swarmStateForCaller(caller);
-  if (state.agents.length === 0) return;
-  for (const info of state.agents) {
-    if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
-    const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
-    if (summary) await mutateSwarm(() => noteAgentContextTokens(info.conversationId, summary.contextTokens));
-  }
-  // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
-  // authority and can terminalize a parked worker. `status` also calls this helper, so there is
-  // no later message/spawn acceptance barrier we can rely on: make every critical revision seen
-  // through the end of measurement durable before publishing the resulting state to the model.
-  try {
-    if (!(await persistCriticalSwarmNow())) {
-      throw new Error('the broker has no immediate durable persistence sink');
-    }
-  } catch (error) {
-    throw new Error(
-      `Worker context/revival state could not cross its durable barrier. Retry the agents call. (${error instanceof Error ? error.message : String(error)})`
-    );
-  }
-}
-
 /** Publish a staged broker mutation only after its exact revision is durable. */
 async function acceptAgentMutation<T extends { commit(): void | boolean; rollback(): void }>(
   factory: () => T,

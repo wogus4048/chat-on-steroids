@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { CAPABILITIES } from './types.js';
 import { familyIdSchema, principalIdSchema, requestIdSchema, reportIdSchema, receiptIdSchema } from './agent-owner.js';
 
-export const EXTERNAL_PRIME_LIMITS = Object.freeze({ principals: 16, familiesPerPrincipal: 64, ledgerRecordsPerPrincipal: 1000, httpBodyBytes: 256 * 1024, resultFileBytes: 1024 * 1024, resultPageBytes: 16384, reportsDefault: 10, reportsMax: 20, reportsTextChars: 32000, taskChars: 4000 });
+export const EXTERNAL_PRIME_LIMITS = Object.freeze({ principals: 16, familiesPerPrincipal: 64, ledgerRecordsPerPrincipal: 1000, httpBodyBytes: 256 * 1024, resultFileBytes: 1024 * 1024, resultPageBytes: 16384, listEnvelopeBytes: 65536, statusDefault: 50, statusMax: 100, reportsDefault: 10, reportsMax: 20, reportsTextChars: 32000, taskChars: 4000 });
 /** Existing sandbox virtual root names, not new UUIDs or physical paths. */
 export const workspaceRootIdSchema = z.string().min(1).max(32).regex(/^[a-z0-9][a-z0-9._-]*$/);
 export const setupProfileIdSchema = z.string().min(1).max(64);
@@ -32,8 +32,8 @@ const uuid = z.string().uuid();
 const revision = z.number().int().min(1);
 const familySelector = z.union([z.object({ new: z.literal(true) }).strict(), z.object({ id: familyIdSchema }).strict()]);
 export const externalToolSchemas = {
-  workers_status: z.object({ family_id: familyIdSchema.optional(), request_id: requestIdSchema.optional() }).strict()
-    .refine(value => value.family_id === undefined || value.request_id === undefined, 'Select either family_id or request_id'),
+  workers_status: z.object({ family_id: familyIdSchema.optional(), request_id: requestIdSchema.optional(), cursor: cursor.optional(), limit: z.number().int().min(1).max(100).optional() }).strict()
+    .refine(value => value.request_id === undefined || (value.family_id === undefined && value.cursor === undefined && value.limit === undefined), 'Receipt lookup excludes family and pagination'),
   workers_spawn: z.object({ request_id: requestIdSchema, family: familySelector, task: text, context: z.string().max(EXTERNAL_PRIME_LIMITS.taskChars).optional(), model: z.string().trim().min(1).max(80).optional(), workspace_root_id: workspaceRootIdSchema }).strict(),
   workers_message: z.object({ request_id: requestIdSchema, family_id: familyIdSchema, worker_id: workerId, message: text, resume: z.boolean().default(false) }).strict(),
   workers_reports: z.object({ family_id: familyIdSchema, cursor: cursor.optional(), limit: z.number().int().min(1).max(20).default(10) }).strict(),
@@ -54,13 +54,14 @@ export const externalMutationReceiptSchema = z.discriminatedUnion('operation', [
   z.object({ operation: z.literal('workers_stop'), receipt: stopReceiptSchema }).strict()
 ]);
 export type ExternalMutationReceipt = z.infer<typeof externalMutationReceiptSchema>;
+const fitsListEnvelope = (value: unknown) => new TextEncoder().encode(JSON.stringify({ ok: true, data: value })).byteLength <= EXTERNAL_PRIME_LIMITS.listEnvelopeBytes;
 const workerSummary = z.object({ worker_id: workerId, status: z.enum(['invited', 'active', 'sleeping', 'waking', 'detached', 'failed', 'finished']), task: text.optional(), conversation_id: z.string().min(1).max(256).nullable().optional() }).strict();
 export const resultReferenceSchema = z.object({ result_id: uuid, total_bytes: z.number().int().nonnegative().max(EXTERNAL_PRIME_LIMITS.resultFileBytes), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 export const externalDataSchemas = {
-  workers_status: z.union([z.object({ families: z.array(z.object({ family_id: familyIdSchema, run_id: uuid, workers: z.array(workerSummary) }).strict()).max(EXTERNAL_PRIME_LIMITS.familiesPerPrincipal) }).strict(), externalMutationReceiptSchema]),
+  workers_status: z.union([z.object({ families: z.array(z.object({ family_id: familyIdSchema, run_id: uuid, workers: z.array(workerSummary).max(EXTERNAL_PRIME_LIMITS.statusMax) }).strict()).max(EXTERNAL_PRIME_LIMITS.familiesPerPrincipal), next_cursor: cursor.nullable() }).strict().refine(value => value.families.reduce((n, row) => n + row.workers.length, 0) <= EXTERNAL_PRIME_LIMITS.statusMax), externalMutationReceiptSchema]).refine(fitsListEnvelope, 'Status envelope exceeds limit'),
   workers_spawn: spawnReceiptSchema,
   workers_message: messageReceiptSchema,
-  workers_reports: z.object({ reports: z.array(z.object({ report_id: reportIdSchema, revision, worker_id: workerId, summary: z.string().max(4000), result: resultReferenceSchema.optional(), delivery_receipt_id: receiptIdSchema }).strict()).max(20), next_cursor: cursor.nullable() }).strict().refine(value => value.reports.reduce((sum, report) => sum + report.summary.length, 0) <= 32000, 'Report page text exceeds limit'),
+  workers_reports: z.object({ reports: z.array(z.object({ report_id: reportIdSchema, revision, worker_id: workerId, summary: z.string().max(4000), summary_truncated: z.boolean(), result: resultReferenceSchema.optional(), delivery_receipt_id: receiptIdSchema }).strict()).max(20), next_cursor: cursor.nullable() }).strict().refine(value => value.reports.reduce((sum, report) => sum + report.summary.length, 0) <= 32000, 'Report page text exceeds limit').refine(fitsListEnvelope, 'Report envelope exceeds limit'),
   workers_ack: ackReceiptSchema,
   workers_result: z.object({ result_id: uuid, text: z.string().max(16384), offset: z.number().int().nonnegative(), next_offset: z.number().int().nonnegative(), eof: z.boolean(), total_bytes: z.number().int().nonnegative().max(EXTERNAL_PRIME_LIMITS.resultFileBytes), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict().refine(value => {
     const bytes = new TextEncoder().encode(value.text).byteLength;
@@ -74,3 +75,14 @@ export const externalResponseSchemas = {
 };
 export type ExternalOutputs = { [K in ExternalToolName]: z.infer<typeof externalDataSchemas[K]> };
 export type ExternalResponses = { [K in ExternalToolName]: z.infer<typeof externalResponseSchemas[K]> };
+
+export type SpawnArgs = ExternalInputs["workers_spawn"];
+export type MessageArgs = ExternalInputs["workers_message"];
+export type StatusArgs = ExternalInputs["workers_status"];
+export type ReportQuery = ExternalInputs["workers_reports"];
+export type AckArgs = ExternalInputs["workers_ack"];
+export type SpawnReceipt = ExternalOutputs["workers_spawn"];
+export type MessageReceipt = ExternalOutputs["workers_message"];
+export type StatusResult = ExternalOutputs["workers_status"];
+export type ReportPage = ExternalOutputs["workers_reports"];
+export type AckReceipt = ExternalOutputs["workers_ack"];
