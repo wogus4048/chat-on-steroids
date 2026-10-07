@@ -1,3 +1,4 @@
+import { assertToolAdmission } from '../mcp/call-context.js';
 /**
  * Codex "unified exec": the runtime behind `exec_command` and `write_stdin`.
  *
@@ -326,6 +327,7 @@ class UnifiedExecProcess {
       }
       let handle: PtyProcess;
       try {
+        assertToolAdmission(['command'], { real: params.cwd });
         handle = pty.spawn(
           file,
           // cmd.exe needs the command line it will actually parse; everything else is
@@ -358,6 +360,7 @@ class UnifiedExecProcess {
     let child: ChildProcess;
     try {
       const verbatim = params.shellType === 'cmd' && process.platform === 'win32';
+      assertToolAdmission(['command'], { real: params.cwd });
       child = spawn(file, args, {
         cwd: params.cwd,
         env: params.env,
@@ -497,6 +500,7 @@ class UnifiedExecProcess {
   }
 
   async write(data: string): Promise<void> {
+    assertToolAdmission(['command']);
     if (this.pty) {
       try {
         this.pty.write(data);
@@ -919,6 +923,7 @@ export class UnifiedExecProcessManager {
     // Reads and writes against one session must not overlap: they share a draining buffer.
     const release = await locked.interactionLock.lock();
     try {
+      assertToolAdmission(['command']);
       const saved = replay(locked.identity);
       if (saved) return saved;
       const current = this.processes.get(request.processId);

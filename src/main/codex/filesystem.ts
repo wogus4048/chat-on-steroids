@@ -25,6 +25,7 @@ import type { FileHandle } from 'node:fs/promises';
 import nodePath from 'node:path';
 
 import { rawPromises } from '../rawfs.js';
+import { assertToolAdmission } from '../mcp/call-context.js';
 
 /**
  * Codex's `MAX_READ_FILE_BYTES`, used only by the primitive that materializes a whole file.
@@ -150,6 +151,7 @@ function pathByteLength(path: string): number {
 
 /** `regular_file::open`: opens a path for reading and refuses anything that is not a real file. */
 async function openFileForRead(path: string): Promise<{ handle: FileHandle; stats: Stats }> {
+  assertToolAdmission(undefined, { real: path });
   const handle = await rawPromises.open(path, 'r');
   let stats: Stats;
   try {
@@ -192,6 +194,7 @@ export async function readFile(path: string, maxBytes: number = MAX_READ_FILE_BY
     for (;;) {
       const remaining = limit - total;
       if (remaining <= 0) break;
+      assertToolAdmission(undefined, { real: path });
       const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, remaining), null);
       if (bytesRead === 0) break;
       chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
@@ -217,6 +220,7 @@ export async function* readFileStream(path: string): AsyncGenerator<Buffer, void
   try {
     const buffer = Buffer.allocUnsafe(FILE_READ_CHUNK_SIZE);
     for (;;) {
+      assertToolAdmission(undefined, { real: path });
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
       if (bytesRead === 0) return;
       yield Buffer.from(buffer.subarray(0, bytesRead));
@@ -240,16 +244,19 @@ export async function readFileText(path: string): Promise<string> {
 
 /** `DirectFileSystem::write_file`. */
 export async function writeFile(path: string, contents: Buffer | string): Promise<void> {
+  assertToolAdmission(undefined, { real: path });
   await rawPromises.writeFile(path, contents);
 }
 
 /** `DirectFileSystem::create_directory`. */
 export async function createDirectory(path: string, options: CreateDirectoryOptions): Promise<void> {
+  assertToolAdmission(undefined, { real: path });
   await rawPromises.mkdir(path, { recursive: options.recursive });
 }
 
 /** `DirectFileSystem::get_metadata`: stats the link itself, then follows it when it is one. */
 export async function getMetadata(path: string): Promise<FileMetadata> {
+  assertToolAdmission(undefined, { real: path });
   const symlinkMetadata = await rawPromises.lstat(path);
   const isSymlink = symlinkMetadata.isSymbolicLink();
   const metadata = isSymlink ? await rawPromises.stat(path) : symlinkMetadata;
@@ -272,6 +279,7 @@ export async function getMetadata(path: string): Promise<FileMetadata> {
  * at enumeration time; explicit access to one is canonicalised and containment-checked separately.
  */
 export async function readDirectory(path: string): Promise<ReadDirectoryEntry[]> {
+  assertToolAdmission(undefined, { real: path });
   const dirents = await rawPromises.readdir(path, { withFileTypes: true });
   const entries: ReadDirectoryEntry[] = [];
   for (const dirent of dirents) {
@@ -293,10 +301,12 @@ export async function remove(path: string, options: RemoveOptions): Promise<void
     throw error;
   }
   if (metadata.isDirectory()) {
+    assertToolAdmission(undefined, { real: path });
     if (options.recursive) await rawPromises.rm(path, { recursive: true });
     else await rawPromises.rmdir(path);
     return;
   }
+  assertToolAdmission(undefined, { real: path });
   await rawPromises.unlink(path);
 }
 

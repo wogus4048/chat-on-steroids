@@ -129,6 +129,7 @@ import {
 } from '../agents.js';
 import { repairPrimeFromResumeShadow } from '../session/continuation.js';
 import {
+  assertToolAdmission,
   currentCall,
   currentCaller,
   noteChanges,
@@ -1672,10 +1673,12 @@ interface PatchRollbackSnapshot {
 /** Keep the connector's atomicity promise bounded even when many large files are patched. */
 const MAX_PATCH_ROLLBACK_BYTES = 64 * 1024 * 1024;
 
-async function readOptionalPatchBytes(real: string): Promise<Buffer | null> {
+async function readOptionalPatchBytes(real: string, settlement = false): Promise<Buffer | null> {
   try {
+    if (!settlement) assertToolAdmission(undefined, { real });
     const stat = await fs.lstat(real);
     if (!stat.isFile()) throw new Error('apply_patch target changed from a file before execution');
+    if (!settlement) assertToolAdmission(undefined, { real });
     return await fs.readFile(real);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
@@ -1687,7 +1690,9 @@ async function capturePatchRollbackSnapshots(resolution: PatchResolution): Promi
   const snapshots = new Map<string, PatchRollbackSnapshot>();
   let total = 0;
   for (const [real, virtual] of resolution.virtualPaths) {
+    assertToolAdmission(undefined, { real });
     const bytes = await readOptionalPatchBytes(real);
+    assertToolAdmission(undefined, { real });
     total += bytes?.length ?? 0;
     if (total > MAX_PATCH_ROLLBACK_BYTES) {
       throw new Error(
@@ -1742,7 +1747,7 @@ async function rollbackFailedPatch(
   for (const [real, snapshot] of snapshots) {
     let current: Buffer | null;
     try {
-      current = await readOptionalPatchBytes(real);
+      current = await readOptionalPatchBytes(real, true);
     } catch {
       problems.push(`${snapshot.virtual}: could not inspect current state`);
       continue;
@@ -1764,7 +1769,7 @@ async function rollbackFailedPatch(
   // Prove the final state rather than assuming successful write/remove calls meant restoration.
   for (const [real, snapshot] of snapshots) {
     try {
-      if (!samePatchState(await readOptionalPatchBytes(real), snapshot.bytes)) {
+      if (!samePatchState(await readOptionalPatchBytes(real, true), snapshot.bytes)) {
         if (!problems.some((problem) => problem.startsWith(`${snapshot.virtual}:`))) {
           problems.push(`${snapshot.virtual}: restore verification failed`);
         }
@@ -1915,10 +1920,12 @@ function patchCapabilityDenial(hunks: readonly Hunk[], caps: Capabilities): stri
   for (const hunk of hunks) {
     if (hunk.kind === 'add_file') {
       if (!caps.create) return 'TOOL_DISABLED: this patch adds a file but Create files and folders is disabled.';
+      assertToolAdmission(['create']);
       continue;
     }
     if (hunk.kind === 'delete_file') {
       if (!caps.deleteFile) return 'TOOL_DISABLED: this patch deletes a file but Delete files is disabled.';
+      assertToolAdmission(['deleteFile']);
       continue;
     }
 
@@ -1935,9 +1942,11 @@ function patchCapabilityDenial(hunks: readonly Hunk[], caps: Capabilities): stri
     if (contentChange && !caps.edit) {
       return 'TOOL_DISABLED: this patch updates a file but Edit files is disabled.';
     }
+    if (contentChange) assertToolAdmission(['edit']);
     if (hunk.movePath !== null && !caps.move) {
       return 'TOOL_DISABLED: this patch moves a file but Move / rename is disabled.';
     }
+    if (hunk.movePath !== null) assertToolAdmission(['move']);
   }
   return null;
 }
@@ -1957,6 +1966,7 @@ async function patchEffectCapabilityDenial(
 ): Promise<string | null> {
   const exists = async (target: string): Promise<boolean> => {
     try {
+      assertToolAdmission(undefined, { real: target });
       await fs.lstat(target);
       return true;
     } catch (error) {
@@ -1969,16 +1979,18 @@ async function patchEffectCapabilityDenial(
 
   for (const hunk of hunks) {
     if (hunk.kind === 'add_file') {
-      if (!caps.edit && (await exists(resolve(hunk.path, '')))) {
-        return 'TOOL_DISABLED: this patch replaces an existing file but Edit files is disabled.';
+      if (await exists(resolve(hunk.path, ''))) {
+        if (!caps.edit) return 'TOOL_DISABLED: this patch replaces an existing file but Edit files is disabled.';
+        assertToolAdmission(['edit']);
       }
       continue;
     }
-    if (hunk.kind !== 'update_file' || hunk.movePath === null || caps.edit) continue;
+    if (hunk.kind !== 'update_file' || hunk.movePath === null) continue;
     const source = resolve(hunk.path, '');
     const destination = resolve(hunk.movePath, '');
     if (!samePath(source, destination) && (await exists(destination))) {
-      return 'TOOL_DISABLED: this patch replaces an existing move destination but Edit files is disabled.';
+      if (!caps.edit) return 'TOOL_DISABLED: this patch replaces an existing move destination but Edit files is disabled.';
+      assertToolAdmission(['edit']);
     }
   }
   return null;
@@ -2263,12 +2275,15 @@ async function readOne(
     if (!options.canBrowse) {
       return { text: `--- / ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
     }
+    assertToolAdmission(['browse']);
+    for (const root of options.roots) assertToolAdmission(undefined, { real: root.path, root });
     const text = options.roots.length === 0
       ? '--- / — no folders are shared yet ---'
       : `--- / — ${options.roots.length} entr${options.roots.length === 1 ? 'y' : 'ies'}, one level ---\n${options.roots.map(root => `d ${root.name}`).join('\n')}`;
     return { text, bytes: Buffer.byteLength(text, 'utf8') };
   }
   const resolved = await resolveIn(options.roots, requested, { access: 'read' });
+  assertToolAdmission(options.canRead ? ['read'] : options.canBrowse ? ['browse'] : ['metadata'], resolved);
   const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead });
 
   if (info.type === 'directory') {

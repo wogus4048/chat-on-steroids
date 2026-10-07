@@ -1,3 +1,4 @@
+import { assertToolAdmission } from '../mcp/call-context.js';
 /**
  * Port of `codex-rs/core/src/tools/handlers/view_image.rs` and its spec in
  * `view_image_spec.rs`.
@@ -161,6 +162,7 @@ export async function viewImage(
     // Enforce the image transport ceiling on the opened file handle too. The metadata check above
     // gives the useful error before opening in the common case, while this closes the growth race
     // between stat and read without ever allocating up to the generic 512 MiB file-read limit.
+    assertToolAdmission(['read'], { real: path });
     fileBytes = await readFile(path, effectiveMaxBytes);
   } catch (error) {
     throw new ViewImageError(`unable to read image at \`${modelVisiblePath}\`: ${describe(error, path, modelVisiblePath)}`);

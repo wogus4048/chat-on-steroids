@@ -77,6 +77,13 @@ export interface CallCaller extends ChatGptCaller {
 }
 
 export interface CallContext {
+  /** Request-local live policy callback; execution owners recheck it after their own awaits. */
+  admission?: (capabilities?: readonly import('../../shared/types.js').Capability[], target?: { real: string; root?: import('../../shared/types.js').Root }) => void;
+  /** Adopt only newly available exact transport proof before a later execution boundary. */
+  refreshAdmission?: () => void;
+  /** Logical requirements already used by this operation, never stored permission decisions. */
+  requiredCapabilities?: Set<import('../../shared/types.js').Capability>;
+  requiredTargets?: Map<string, { real: string; root?: import('../../shared/types.js').Root }>;
   /** Result publication belongs to the transport, not to the generation-wide request ID. */
   publication?: OutputPublication;
   /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */
@@ -113,6 +120,29 @@ export interface CallContext {
 }
 
 const storage = new AsyncLocalStorage<CallContext>();
+
+/** App-internal I/O has no caller callback. This only gates the current model operation. */
+export function assertToolAdmission(capabilities?: readonly import('../../shared/types.js').Capability[], target?: { real: string; root?: import('../../shared/types.js').Root }): void {
+  const context = storage.getStore();
+  if (context && capabilities?.length) {
+    context.requiredCapabilities ??= new Set();
+    for (const capability of capabilities) context.requiredCapabilities.add(capability);
+  }
+  context?.refreshAdmission?.();
+  context?.admission?.(context.requiredCapabilities ? [...context.requiredCapabilities] : capabilities, target);
+  if (context && target && !context.requiredTargets?.has(target.real)) {
+    context.requiredTargets ??= new Map();
+    context.requiredTargets.set(target.real, { real: target.real, ...(target.root ? { root: { ...target.root } } : {}) });
+  }
+}
+
+/** Async reply owners keep the originating caller callback, never the reply transport's identity. */
+export function captureToolAdmission(capabilities?: readonly import('../../shared/types.js').Capability[], target?: { real: string; root?: import('../../shared/types.js').Root }): (() => void) | undefined {
+  const context = storage.getStore();
+  if (!context) return undefined;
+  assertToolAdmission(capabilities, target);
+  return () => storage.run(context, () => assertToolAdmission(capabilities, target));
+}
 
 export function emptyEvidence(): CallEvidence {
   return {

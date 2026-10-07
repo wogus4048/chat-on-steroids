@@ -17,6 +17,7 @@ import sharp from 'sharp';
 import { rawPromises as fs } from './rawfs.js';
 import { wakeBrowserWork } from './browser-wake.js';
 import { logInfo } from './logger.js';
+import { captureToolAdmission } from './mcp/call-context.js';
 
 /** The largest original accepted; generated images are a few megabytes. */
 export const MAX_IMAGE_EXPORT_BYTES = 25 * 1024 * 1024;
@@ -52,6 +53,7 @@ interface Pending {
   messageId: string;
   assetId: string;
   target: ImageExportTarget;
+  admission?: () => void;
   expiresAt: number;
   settle: (result: ImageExportResult | Error) => void;
 }
@@ -83,12 +85,13 @@ export function exportImage(
   target: ImageExportTarget,
   timeoutMs = IMAGE_EXPORT_TIMEOUT_MS
 ): Promise<ImageExportResult> {
+  const admission = captureToolAdmission(['create'], target);
   return new Promise((resolve, reject) => {
     const nonce = randomUUID();
     const timer = setTimeout(() => entry.settle(new ImageExportError('the browser did not deliver the image in time. Make sure the chat is open in ChatGPT and try again.')), timeoutMs);
     timer.unref?.();
     const entry: Pending = {
-      nonce, ...image, target, expiresAt: Date.now() + timeoutMs,
+      nonce, ...image, target, admission, expiresAt: Date.now() + timeoutMs,
       settle: (result) => {
         if (pending.get(nonce) !== entry) return;
         pending.delete(nonce);
@@ -119,14 +122,14 @@ export async function completeImageExport(raw: unknown): Promise<boolean> {
     return true;
   }
   try {
-    entry.settle(await save(Buffer.from(body.data, 'base64'), entry.target));
+    entry.settle(await save(Buffer.from(body.data, 'base64'), entry.target, entry.admission));
   } catch (error) {
     entry.settle(error instanceof ImageExportError ? error : new ImageExportError(`the image could not be saved: ${(error as Error).message}`));
   }
   return true;
 }
 
-async function save(bytes: Buffer, target: ImageExportTarget): Promise<ImageExportResult> {
+async function save(bytes: Buffer, target: ImageExportTarget, admission?: () => void): Promise<ImageExportResult> {
   if (bytes.length === 0) throw new ImageExportError('ChatGPT handed out an empty image file.');
   if (bytes.length > MAX_IMAGE_EXPORT_BYTES) throw new ImageExportError(PAGE_ERRORS.too_large!);
   let metadata: Awaited<ReturnType<ReturnType<typeof sharp>["metadata"]>>;
@@ -138,12 +141,15 @@ async function save(bytes: Buffer, target: ImageExportTarget): Promise<ImageExpo
   const format = metadata.format ?? 'unknown';
   const file = exportFileName(target.real, format);
   const virtual = exportFileName(target.virtual, format);
+  admission?.();
   await fs.mkdir(path.dirname(file), { recursive: true });
   // Written beside the destination, then linked into place: a link never replaces an existing
   // file, so a name taken meanwhile fails instead of being overwritten, and no half file appears.
   const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.part`);
-  await fs.writeFile(temporary, bytes, { flag: 'wx' });
   try {
+    admission?.();
+    await fs.writeFile(temporary, bytes, { flag: 'wx' });
+    admission?.();
     await fs.link(temporary, file);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new ImageExportError(`${virtual} already exists. Choose another name.`);

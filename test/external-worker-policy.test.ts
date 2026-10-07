@@ -6,7 +6,7 @@ import { defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/mai
 import { createExternalPrincipal, authenticateExternal, revokeExternalPrincipal } from '../src/main/external-prime-auth.js';
 import * as broker from '../src/main/agents.js';
 import { conversationAccessRefusal } from '../src/main/session/conversation-access.js';
-import { createRegistrar, dispatch, type ToolContext } from '../src/main/mcp/kernel.js';
+import { createRegistrar, dispatch, guard, type ToolContext } from '../src/main/mcp/kernel.js';
 import { registerCoreTools } from '../src/main/mcp/tools-core.js';
 import { emptyEvidence, type CallContext } from '../src/main/mcp/call-context.js';
 import { initSessionStore, flushSessions, resetSessionStoreForTests, createSession } from '../src/main/session/store.js';
@@ -261,4 +261,140 @@ it('keeps selected managed Skills whose canonical files are inside the external 
     await expect(prepareSessionPrompt('/inside', { workspace: async () => ({ virtual: '/allowed', real: path.join(dir, 'allowed') }), toolContext: () => externalPlacementToolContext(principalId, placement, ctx) })).rejects.toThrow('unavailable');
     expect(opened).not.toContain(path.join(skills.skillsDirectory()!, 'inside', 'SKILL.md'));
   } finally { spy.mockRestore(); }
+});
+
+it('review probe: revoked secondary root must not return data after path await', async () => {
+  const config = getConfig();
+  await saveConfig({ ...config, externalPrime: { ...config.externalPrime, principals: config.externalPrime.principals.map(row => ({ ...row, rootIds: ['allowed', 'other'] })) } });
+  const actual = fs.realpath.bind(fs);
+  let resume!: () => void; let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const spy = vi.spyOn(fs, 'realpath').mockImplementation(async (target, options) => {
+    if (String(target) === path.join(dir, 'other', 'secret.txt')) { entered(); await gate; }
+    return actual(target, options as never);
+  });
+  try {
+    const pending = read(['/other/secret.txt']); await started;
+    const now = getConfig();
+    await saveConfig({ ...now, externalPrime: { ...now.externalPrime, principals: now.externalPrime.principals.map(row => ({ ...row, rootIds: ['allowed'], policyRevision: row.policyRevision + 1 })) } });
+    resume(); const result = await pending;
+    expect(JSON.stringify(result)).not.toContain('OTHER_ROOT_SECRET');
+  } finally { resume(); spy.mockRestore(); }
+});
+it('review probe: read capability revoked during path await must not return data', async () => {
+  const actual = fs.realpath.bind(fs);
+  let resume!: () => void; let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const spy = vi.spyOn(fs, 'realpath').mockImplementation(async (target, options) => {
+    if (String(target) === path.join(dir, 'allowed', 'file.txt')) { entered(); await gate; }
+    return actual(target, options as never);
+  });
+  try {
+    const pending = read(['/allowed/file.txt']); await started;
+    const now = getConfig();
+    await saveConfig({ ...now, externalPrime: { ...now.externalPrime, principals: now.externalPrime.principals.map(row => ({ ...row, capabilities: [], policyRevision: row.policyRevision + 1 })) } });
+    resume(); const result = await pending;
+    expect(JSON.stringify(result)).not.toContain('ALLOWED');
+  } finally { resume(); spy.mockRestore(); }
+});
+for (const change of ['app-root-removal', 'app-root-path', 'app-read-capability'] as const) {
+  it(`rejects ${change} after target resolution begins without relying on principal revision`, async () => {
+    const config = getConfig();
+    await saveConfig({ ...config, externalPrime: { ...config.externalPrime, principals: config.externalPrime.principals.map(row => ({ ...row, rootIds: ['allowed', 'other'] })) } });
+    const target = path.join(dir, 'other', 'secret.txt');
+    const actual = fs.realpath.bind(fs);
+    let resume!: () => void; let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const spy = vi.spyOn(fs, 'realpath').mockImplementation(async (candidate, options) => { if (String(candidate) === target) { entered(); await gate; } return actual(candidate, options as never); });
+    const open = vi.spyOn(fs, 'open');
+    try {
+      const pending = read(['/other/secret.txt']); await started;
+      const now = getConfig();
+      if (change === 'app-root-removal') await saveConfig({ ...now, roots: now.roots.filter(root => root.name !== 'other') });
+      else if (change === 'app-root-path') await saveConfig({ ...now, roots: now.roots.map(root => root.name === 'other' ? { ...root, path: path.join(dir, 'allowed') } : root) });
+      else await saveConfig({ ...now, capabilities: { ...now.capabilities, read: false } });
+      resume(); const result = await pending;
+      expect(result.isError).toBe(true); expect(JSON.stringify(result)).not.toContain('OTHER_ROOT_SECRET');
+      expect(open.mock.calls.some(call => String(call[0]) === target)).toBe(false);
+    } finally { resume(); spy.mockRestore(); open.mockRestore(); }
+  });
+}
+it('keeps the read requirement when exact external proof arrives after read admission but before file open', async () => {
+  const { readTextFile } = await import('../src/main/codex/read-backend.js');
+  const correlation = await import('../src/main/session/correlation.js');
+  const config = getConfig();
+  await saveConfig({ ...config, externalPrime: { ...config.externalPrime, principals: config.externalPrime.principals.map(row => ({ ...row, capabilities: [] })) } });
+  const originalSession = caller.caller.sessionId!;
+  const late = { ...caller, caller: { ...caller.caller, conversationId: null, sessionId: null, requestId: 'late-external-read-requirement' } };
+  const target = path.join(dir, 'allowed', 'file.txt');
+  const actual = fs.lstat.bind(fs);
+  const spy = vi.spyOn(fs, 'lstat').mockImplementation(async (candidate, options) => {
+    if (String(candidate) === target) correlation.observeRequestCorrelation({ requestId: late.caller.requestId!, conversationId: 'external-worker', sessionId: originalSession, messageId: 'late-proof', tool: 'read', observedAt: Date.now() });
+    return actual(candidate, options as never);
+  });
+  const open = vi.spyOn(fs, 'open');
+  try {
+    const result = await dispatch('read', {}, null, null, 'core', () => guard('read', async () => ({ content: [{ type: 'text', text: (await readTextFile(target)).text }] })), late);
+    expect(result.isError).toBe(true); expect(JSON.stringify(result)).not.toContain('ALLOWED');
+    expect(open.mock.calls.some(call => String(call[0]) === target)).toBe(false);
+  } finally { spy.mockRestore(); open.mockRestore(); correlation.resetCorrelationRegistryForTests(); }
+});
+for (const revocation of ['principal', 'read-only'] as const) it(`rolls back an already written patch hunk after ${revocation} revocation before the next write`, async () => {
+  const config = getConfig();
+  await saveConfig({ ...config, externalPrime: { ...config.externalPrime, principals: config.externalPrime.principals.map(row => ({ ...row, capabilities: ['read', 'edit'] })) } });
+  const first = path.join(dir, 'allowed', 'file.txt'); const second = path.join(dir, 'allowed', 'second.txt');
+  await fs.writeFile(second, 'SECOND');
+  const actual = fs.writeFile.bind(fs); let firstWrites = 0;
+  const spy = vi.spyOn(fs, 'writeFile').mockImplementation(async (candidate, data, options) => {
+    await actual(candidate, data, options as never);
+    if (String(candidate) === first && ++firstWrites === 1) {
+      const now = getConfig();
+      if (revocation === 'read-only') await saveConfig({ ...now, readOnly: true });
+      else await saveConfig({ ...now, externalPrime: { ...now.externalPrime, principals: now.externalPrime.principals.map(row => ({ ...row, capabilities: [], policyRevision: row.policyRevision + 1 })) } });
+    }
+  });
+  try {
+    const reg = createRegistrar(null, ctx, 'core'); registerCoreTools(reg);
+    const patch = '*** Begin Patch\n*** Update File: /allowed/file.txt\n@@\n-ALLOWED\n+CHANGED\n*** Update File: /allowed/second.txt\n@@\n-SECOND\n+CHANGED_SECOND\n*** End Patch';
+    const result = await reg.invokeNested('apply_patch', { patch }, caller);
+    expect(result.isError).toBe(true);
+    expect(firstWrites).toBe(2);
+    expect(await fs.readFile(first, 'utf8')).toBe('ALLOWED');
+    expect(await fs.readFile(second, 'utf8')).toBe('SECOND');
+  } finally { spy.mockRestore(); }
+});
+it('refuses an ambiguous worker projection without treating it as a proven ordinary GPT caller', async () => {
+  const spy = vi.spyOn(broker, 'workerPrimeOwner').mockReturnValue({ owned: true, primeConversationId: null, runId: null });
+  try { expect(await conversationAccessRefusal('external-worker')).toContain('ACCESS_REVOKED'); }
+  finally { spy.mockRestore(); }
+});
+it('preserves only existing completion counters and fixed routes when revocation withholds a partial native error', async () => {
+  const { ComputerError } = await import('../src/main/computer/index.js');
+  const result = await dispatch('computer', {}, null, null, 'desktop', () => guard('computer', async () => {
+    const now = getConfig();
+    await saveConfig({ ...now, externalPrime: { ...now.externalPrime, principals: now.externalPrime.principals.map(row => ({ ...row, capabilities: [], policyRevision: row.policyRevision + 1 })) } });
+    throw new ComputerError('RAW_NATIVE_ERROR_MUST_NOT_COPY', { completedCount: 2, failedIndex: 2, completedRoutes: ['local', 'sendinput'] });
+  }), caller);
+  expect(result.isError).toBe(true);
+  expect(result.structuredContent).toEqual({ error: { completed_count: 2, failed_index: 2, completed_routes: ['local', 'sendinput'] } });
+  expect(JSON.stringify(result)).not.toContain('RAW_NATIVE_ERROR_MUST_NOT_COPY');
+  expect(JSON.stringify(result)).not.toContain('No tool was run');
+});
+it('withholds a target outside the external roots when exact proof arrives only after the read completed', async () => {
+  const { readTextFile } = await import('../src/main/codex/read-backend.js');
+  const correlation = await import('../src/main/session/correlation.js');
+  const originalSession = caller.caller.sessionId!;
+  const late = { ...caller, caller: { ...caller.caller, conversationId: null, sessionId: null, requestId: 'late-external-read-target' } };
+  try {
+    const result = await dispatch('read', {}, null, null, 'core', () => guard('read', async () => {
+      const text = (await readTextFile(path.join(dir, 'other', 'secret.txt'))).text;
+      correlation.observeRequestCorrelation({ requestId: late.caller.requestId!, conversationId: 'external-worker', sessionId: originalSession, messageId: 'late-target-proof', tool: 'read', observedAt: Date.now() });
+      return { content: [{ type: 'text', text }] };
+    }), late);
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('OTHER_ROOT_SECRET');
+  } finally { correlation.resetCorrelationRegistryForTests(); }
 });

@@ -67,3 +67,14 @@ it('gives up with a clear reason when no browser delivers in time', async () => 
   await expect(exportImage(image, target('late.png'), 20)).rejects.toThrow('did not deliver the image in time');
   expect(pendingImageExports()).toEqual([]);
 });
+it('rechecks its original caller admission when a later HTTP reply would save the image', async () => {
+  const { runInCallContext, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+  let revoked = false;
+  const context = { startedAt: Date.now(), transportKey: null, agent: null, caller: { transportKey: null, requestId: null, conversationId: 'image-owner' }, outcome: null, evidence: emptyEvidence(), admission: () => { if (revoked) throw new Error('ACCESS_REVOKED'); } };
+  const saved = runInCallContext(context, () => exportImage(image, target('withdrawn.png')));
+  const rejected = expect(saved).rejects.toThrow('ACCESS_REVOKED');
+  const [job] = pendingImageExports(); revoked = true;
+  await completeImageExport({ nonce: job!.nonce, data: (await png()).toString('base64') });
+  await rejected;
+  expect(await fs.readdir(dir)).toEqual([]);
+});

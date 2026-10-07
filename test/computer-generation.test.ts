@@ -22,7 +22,7 @@ const fake = vi.hoisted(() => {
   const requests: Array<Record<string, any>> = [];
   const children: Array<Transport> = [];
   const clipboard = { writeText: vi.fn(async (_text: string) => {}), readText: vi.fn(async () => '') };
-  const overrides = { focusFailure: false, geometry: false, semanticOnly: false };
+  const overrides = { focusFailure: false, geometry: false, semanticOnly: false, beforeReady: null as (() => void) | null };
   class Transport extends Emitter {
     readonly pid = 9000 + children.length;
     exitCode: number | null = null;
@@ -39,7 +39,7 @@ const fake = vi.hoisted(() => {
     constructor(readonly addon = true) {
       super();
       children.push(this);
-      queueMicrotask(() => addon ? this.emit('message', { type: 'ready' }) : this.emit('spawn'));
+      queueMicrotask(() => { overrides.beforeReady?.(); addon ? this.emit('message', { type: 'ready' }) : this.emit('spawn'); });
     }
     postMessage({ request }: { request: Record<string, any> }) {
       this.answer(request, true);
@@ -122,6 +122,7 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     fake.overrides.focusFailure = false;
     fake.overrides.geometry = false;
     fake.overrides.semanticOnly = false;
+    fake.overrides.beforeReady = null;
     Object.defineProperty(process, 'platform', { ...platform, value: transport === 'addon' ? 'darwin' : 'linux' });
     vi.stubEnv('COS_MACOS_DESKTOP_HELPER', '');
     computer = await import('../src/main/computer/index.js');
@@ -133,6 +134,17 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     vi.unstubAllEnvs();
     Object.defineProperty(process, 'platform', platform);
   });
+  it('rechecks caller admission after native helper startup before any request is sent', async () => {
+    const { runInCallContext, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+    let revoked = false;
+    fake.overrides.beforeReady = () => { revoked = true; };
+    const context = { startedAt: Date.now(), transportKey: null, agent: null, caller: { transportKey: null, requestId: null, conversationId: 'native-start-owner' }, outcome: null, evidence: emptyEvidence(), admission: () => { if (revoked) throw new Error('ACCESS_REVOKED'); } };
+    await expect(runInCallContext(context, () => computer.listWindows())).rejects.toThrow('ACCESS_REVOKED');
+    expect(fake.requests).toHaveLength(0);
+    fake.overrides.beforeReady = null;
+    await expect(computer.listWindows()).resolves.toHaveProperty('windows');
+  });
+
   const replace = async () => {
     fake.children.at(-1)!.close();
     await computer.listWindows();

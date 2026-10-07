@@ -24,6 +24,7 @@ import { findWindowsPowerShell, terminateProcessTree } from '../exec.js';
 import { logInfo, logWarn } from '../logger.js';
 import type { MacOSDesktopAccessStatus, MacOSPermissionState } from '../../shared/types.js';
 import { HELPER_SCRIPT } from './helper.js';
+import { assertToolAdmission } from '../mcp/call-context.js';
 
 /** Width the screenshot is scaled down to, matching computer-use convention. */
 export const DEFAULT_SCREENSHOT_WIDTH = 1280;
@@ -719,6 +720,7 @@ async function startMacOSAddon(): Promise<MacOSAddonRuntime> {
 async function sendMacOSAddonRequest(request: Record<string, unknown>, expected?: ExpectedHelper): Promise<Record<string, any>> {
   const runtime = await startMacOSAddon();
   assertHelperGeneration(runtime.generation, expected);
+  assertToolAdmission(request['op'] === 'act' || request['op'] === 'focus' ? ['control'] : request['op'] === 'capture' ? ['screen'] : undefined);
   if (runtime.pending) throw new ComputerError('macOS Desktop addon received overlapping requests.');
   return new Promise<Record<string, any>>((resolve, reject) => {
     let pending: PendingHelperRequest;
@@ -788,6 +790,7 @@ async function sendHelperRequest(request: Record<string, unknown>, expected?: Ex
   if (useMacOSDesktopAddon()) return sendMacOSAddonRequest(request, expected);
   const runtime = await startHelper();
   assertHelperGeneration(runtime.generation, expected);
+  assertToolAdmission(request['op'] === 'act' || request['op'] === 'focus' ? ['control'] : request['op'] === 'capture' ? ['screen'] : undefined);
   if (runtime.pending) throw new ComputerError('Desktop helper received overlapping requests.');
 
   return new Promise<Record<string, any>>((resolve, reject) => {
@@ -816,6 +819,7 @@ function runHelper(request: Record<string, unknown>, expected?: ExpectedHelper):
   const result = helperQueue.then(async () => {
     const startedAt = Date.now();
     try {
+      assertToolAdmission();
       return await sendHelperRequest(request, expected);
     } finally {
       logInfo(
@@ -867,6 +871,7 @@ let exclusiveQueue: Promise<unknown> = Promise.resolve();
 function exclusive<T>(task: () => Promise<T>): Promise<T> {
   const queuedAt = Date.now();
   const measured = async (): Promise<T> => {
+    assertToolAdmission();
     const startedAt = Date.now();
     try {
       return await task();
@@ -1848,6 +1853,7 @@ async function actLocked(
         // the explicitly selected window; it is one authored paste, not two counted steps.
         const nativeClipboard = await electronClipboard();
         assertHelperGeneration(helperGeneration, expected);
+        assertToolAdmission(['clipboardWrite']);
         await nativeClipboard.writeText(action.text);
       } catch (err) {
         throw localActionFailure(err, completedCount, index);
@@ -1879,6 +1885,7 @@ async function actLocked(
       try {
         const nativeClipboard = await electronClipboard();
         assertHelperGeneration(helperGeneration, expected);
+        assertToolAdmission(['clipboardRead']);
         clipboard.push(await nativeClipboard.readText());
         assertHelperGeneration(helperGeneration, expected);
       } catch (err) {
@@ -1893,6 +1900,7 @@ async function actLocked(
       try {
         const nativeClipboard = await electronClipboard();
         assertHelperGeneration(helperGeneration, expected);
+        assertToolAdmission(['clipboardWrite']);
         await nativeClipboard.writeText(action.text);
       } catch (err) {
         throw localActionFailure(err, completedCount, index);

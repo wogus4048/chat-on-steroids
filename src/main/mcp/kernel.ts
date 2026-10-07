@@ -105,7 +105,9 @@ import {
 import { requestCorrelation } from '../session/correlation.js';
 import { summarizeRunningCall } from '../session/summarize.js';
 import { anyChatBlocked, BLOCKED_CHAT_REFUSAL, isChatBlocked } from '../session/blocked-chats.js';
-import { STRICT_CHAT_REFUSAL, conversationAccessRefusal, strictChatAllowlistEnabled, externalWorkerGrant, externalWorkerAccessRefusal, externalPlacementGrant, externalWorkerOriginRefusal } from '../session/conversation-access.js';
+import { STRICT_CHAT_REFUSAL, conversationAccessRefusal, strictChatAllowlistEnabled, externalWorkerGrant, externalWorkerAccessRefusal, externalPlacementGrant, externalWorkerOriginRefusal, captureExternalWorkerAdmission } from '../session/conversation-access.js';
+import { assertToolAdmission } from './call-context.js';
+import { ExternalPrimeError } from '../external-prime-auth.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import {
   acknowledgeBackgroundExecOutput,
@@ -359,6 +361,7 @@ async function withIdentityRecoveredNotice(context: CallContext, result: ToolRes
 
 /** Maps runtime errors to short model-facing text without ever exposing real paths. */
 export function friendlyError(err: unknown): string {
+  if (err instanceof ExternalPrimeError) return `${err.code}: ${err.message}`;
   if (err instanceof SandboxError || err instanceof ComputerError) return err.message;
   const code = (err as NodeJS.ErrnoException).code;
   if (code === 'ENOENT') return 'Not found';
@@ -440,6 +443,7 @@ export async function guard(name: string, fn: () => Promise<ToolResult>): Promis
       err instanceof FsOpError ||
       err instanceof ExecError ||
       err instanceof AgentError
+      || err instanceof ExternalPrimeError
     ) {
       noteOutcomeSafely('tool_rejected');
       logInfo(`tool ${name} rejected in ${elapsed} ms: ${message}`);
@@ -447,6 +451,7 @@ export async function guard(name: string, fn: () => Promise<ToolResult>): Promis
       noteOutcomeSafely('tool_internal_error');
       logWarn(`tool ${name} failed in ${elapsed} ms: ${message}`);
     }
+    if (err instanceof ComputerError && err.completedCount !== null && err.failedIndex !== null) return { ...fail(message), structuredContent: { error: { completed_count: err.completedCount, failed_index: err.failedIndex, completed_routes: err.completedRoutes } } };
     return err instanceof IdentityLostError ? failIdentity(message) : fail(message);
   }
 }
@@ -459,6 +464,21 @@ function noteOutcomeSafely(outcome: ToolOutcome): void {
   } catch {
     /* no call context: nothing to record against */
   }
+}
+
+/** Only existing numeric/enum completion evidence survives a revoked output body. */
+function revokedOutput(reason: string, prior: ToolResult): ToolResult {
+  const error = prior.structuredContent && typeof prior.structuredContent === 'object'
+    ? (prior.structuredContent as { error?: unknown }).error : null;
+  if (!error || typeof error !== 'object') return fail(reason);
+  const source = error as Record<string, unknown>;
+  const completed = source.completed_count;
+  const failed = source.failed_index;
+  if (!Number.isSafeInteger(completed) || Number(completed) < 0 || !Number.isSafeInteger(failed) || Number(failed) < 0) return fail(reason);
+  const routes = source.completed_routes;
+  const safe = { completed_count: completed, failed_index: failed,
+    ...(Array.isArray(routes) && routes.every(route => ['uia', 'sendinput', 'focus', 'shell', 'local'].includes(route)) ? { completed_routes: routes } : {}) };
+  return { ...fail(Number(completed) > 0 ? `ACCESS_REVOKED: further execution was refused; ${completed} earlier actions completed.` : reason), structuredContent: { error: safe } };
 }
 
 /**
@@ -697,7 +717,20 @@ export async function dispatch(
       ? { ...parent.caller }
       : { kind: 'chatgpt', transportKey, requestId, conversationId: null, sessionId: null, setupProfileId },
     outcome: null,
+    admission: parent?.admission,
+    requiredCapabilities: new Set(),
+    requiredTargets: new Map(),
     evidence: emptyEvidence()
+  };
+  context.refreshAdmission = () => {
+    if (context.admission) return;
+    const exact = context.caller.conversationId ? null : requestCorrelation(context.caller.requestId);
+    if (exact) setCallerConversation(context, exact.conversationId);
+    const refusal = workerConnectionProfileRefusal(context.caller);
+    if (refusal) throw new SandboxError(refusal);
+    context.admission = captureExternalWorkerAdmission(context.caller.conversationId);
+    if (context.admission) for (const target of context.requiredTargets?.values() ?? [])
+      context.admission([...context.requiredCapabilities ?? []], target);
   };
   // Every call runs through here, so the proof is installed before any call can be running.
   setRequestOwner(requestOwner);
@@ -705,6 +738,12 @@ export async function dispatch(
     const result = await trackMcpRequest(() =>
       trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent))
     );
+    if (parent && !result.isError) {
+      parent.requiredCapabilities ??= new Set();
+      parent.requiredTargets ??= new Map();
+      for (const capability of context.requiredCapabilities ?? []) parent.requiredCapabilities.add(capability);
+      for (const [real, target] of context.requiredTargets ?? []) if (!parent.requiredTargets.has(real)) parent.requiredTargets.set(real, target);
+    }
     // In-process callers have no socket; resolving their outer invocation publishes it.
     if (!parent && !inboundPublication()) context.publication!.completedAt = Date.now();
     return result;
@@ -1020,6 +1059,8 @@ async function dispatchTracked(
   let handlerRan = false;
   markTiming('identity');
   const invokeHandler = (): Promise<ToolResult> => {
+    try { context.refreshAdmission?.(); context.admission?.([...context.requiredCapabilities ?? []]); }
+    catch (error) { return Promise.resolve(fail(friendlyError(error))); }
     handlerRan = true;
     return run();
   };
@@ -1080,7 +1121,12 @@ async function dispatchTracked(
   await reconcileAgentRequestOwners().catch(error => {
     logWarn(`Worker ownership recovery deferred after tool completion: ${error instanceof Error ? error.message : String(error)}`);
   });
-  const deliveryPolicyRefusal = (strictChatAllowlistEnabled()
+  let spentAuthorityRefusal: string | null = null;
+  try {
+    context.refreshAdmission?.(); context.admission?.([...context.requiredCapabilities ?? []]);
+    if (context.admission) for (const target of context.requiredTargets?.values() ?? []) context.admission([...context.requiredCapabilities ?? []], target);
+  } catch (error) { spentAuthorityRefusal = friendlyError(error); }
+  const deliveryPolicyRefusal = spentAuthorityRefusal ?? (strictChatAllowlistEnabled()
     ? await conversationAccessRefusal(context.caller.conversationId)
     : conversationAdmissionRefusal(context.caller.conversationId, surface)) ??
     conversationAdmissionRefusal(context.caller.conversationId, surface) ??
@@ -1130,7 +1176,8 @@ async function dispatchTracked(
   // subtly earlier internal value that omits the worker report most likely to matter later.
   // The Plugins handler owns validation/redaction of external results. A dispatcher refusal
   // never visited that owner and therefore needs its own single redaction pass.
-  const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
+  const safeResult = spentAuthorityRefusal ? revokedOutput(spentAuthorityRefusal, result) : result;
+  const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(safeResult) as ToolResult : safeResult;
   let delivered = nested ? baseResult : withUnattributedNotice(
     context.caller.conversationId,
     deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish),
@@ -1219,6 +1266,10 @@ async function dispatchTracked(
     for (const family of agentFamiliesForCaller(context.caller)) if (family.running) await mutateSwarm(() => releaseQuiescentRun({}, family.run_id));
   }
   markTiming('recorder', true);
+  try {
+    context.refreshAdmission?.(); context.admission?.([...context.requiredCapabilities ?? []]);
+    if (context.admission) for (const target of context.requiredTargets?.values() ?? []) context.admission([...context.requiredCapabilities ?? []], target);
+  } catch (error) { return revokedOutput(friendlyError(error), delivered); }
   return delivered;
 }
 
@@ -1358,6 +1409,7 @@ export async function resolveIn(
   // Absolute only: a workspace learned from a relative path would let one loose resolution
   // decide where the next loose resolution points. See workspace.ts.
   if (isAbsoluteVirtualPath(requested) || isNativeWindowsPath(requested)) await learnWorkspace(resolved);
+  assertToolAdmission(undefined, resolved);
   return resolved;
 }
 
@@ -1555,6 +1607,7 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
               : `TOOL_DISABLED: ${name} requires the "${CAPABILITY_LABELS[cap]}" permission. Ask the user to enable "${CAPABILITY_LABELS[cap]}" in the app, then retry.`
           );
         }
+        assertToolAdmission([cap]);
         return fn();
       });
     },

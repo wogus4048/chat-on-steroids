@@ -1,3 +1,4 @@
+import { assertToolAdmission } from '../mcp/call-context.js';
 /**
  * `read`'s filesystem backend, rebuilt on Codex's primitives.
  *
@@ -163,6 +164,7 @@ export async function listDirectoryLevel(
   maxEntries: number,
   includeFileSizes = true
 ): Promise<{ entries: DirEntry[]; truncated: boolean }> {
+  assertToolAdmission(['browse'], { real: realDir });
   const raw = await readDirectory(realDir);
   // Directories first, then names, which is the order `read` has always printed.
   raw.sort((left, right) => {
@@ -241,6 +243,7 @@ export async function readTextFile(
   realPath: string,
   opts: { startLine?: number; endLine?: number; maxBytes?: number } = {}
 ): Promise<ReadTextResult> {
+  assertToolAdmission(['read'], { real: realPath });
   const metadata = await getMetadata(realPath);
   if (!metadata.isFile) throw new FsOpError('Not a file');
 

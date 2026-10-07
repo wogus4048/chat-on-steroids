@@ -50,3 +50,26 @@ describe('desktop local-only action path', () => {
     expect(mocks.spawn).not.toHaveBeenCalled();
   });
 });
+
+it('refuses queued clipboard work after its caller admission is revoked', async () => {
+  const { runInCallContext, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+  let revoked = false;
+  const context = { startedAt: Date.now(), transportKey: null, agent: null, caller: { transportKey: null, requestId: null, conversationId: 'queue-owner' }, outcome: null, evidence: emptyEvidence(), admission: () => { if (revoked) throw new Error('ACCESS_REVOKED'); } };
+  const first = act([{ type: 'wait', ms: 20 }]);
+  const pending = runInCallContext(context, () => act([{ type: 'write_clipboard', text: 'MUST_NOT_LAND' }]));
+  const rejected = expect(pending).rejects.toThrow('ACCESS_REVOKED');
+  revoked = true;
+  await first; await rejected;
+  expect(mocks.writeText).not.toHaveBeenCalled();
+  expect(mocks.spawn).not.toHaveBeenCalled();
+});
+it('rechecks clipboard admission after a dispatched local wait and keeps partial results', async () => {
+  const { runInCallContext, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+  let revoked = false;
+  const context = { startedAt: Date.now(), transportKey: null, agent: null, caller: { transportKey: null, requestId: null, conversationId: 'wait-owner' }, outcome: null, evidence: emptyEvidence(), admission: () => { if (revoked) throw new Error('ACCESS_REVOKED'); } };
+  const pending = runInCallContext(context, () => act([{ type: 'wait', ms: 20 }, { type: 'write_clipboard', text: 'MUST_NOT_LAND' }]));
+  const rejected = expect(pending).rejects.toMatchObject({ completedCount: 1 });
+  await Promise.resolve(); await Promise.resolve(); revoked = true;
+  await rejected;
+  expect(mocks.writeText).not.toHaveBeenCalled();
+});

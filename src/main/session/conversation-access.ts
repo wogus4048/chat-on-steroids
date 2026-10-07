@@ -7,6 +7,41 @@ import { isChatTrusted } from './trusted-chats.js';
 import { ExternalPrimeError } from '../external-prime-auth.js';
 import type { ExternalPrincipal } from '../../shared/external-prime.js';
 import type { WorkerPrimeOwner } from '../agents.js';
+import { effectiveCapabilities } from '../config.js';
+import { isContained } from '../sandbox.js';
+import type { CallContext } from '../mcp/call-context.js';
+import { createHash } from 'node:crypto';
+
+/** Capture ownership and a policy generation fence, never a reusable permission allowance. */
+export function captureExternalWorkerAdmission(conversationId: string | null | undefined): CallContext['admission'] {
+  const initial = externalWorkerGrant(conversationId);
+  if (!initial || !conversationId) return undefined;
+  const owner = { principalId: initial.principal.principalId, familyId: initial.worker.familyId,
+    runId: initial.worker.runId, revision: initial.principal.policyRevision };
+  const policyIdentity = () => {
+    const config = getConfig();
+    const current = externalWorkerGrant(conversationId);
+    return createHash('sha256').update(JSON.stringify({ roots: config.roots.map(root => [root.name, root.path]),
+      caps: effectiveCapabilities(config), readOnly: config.readOnly, grantedRoots: current?.principal.rootIds,
+      grantedCapabilities: current?.principal.capabilities })).digest('hex');
+  };
+  const generation = policyIdentity();
+  return (capabilities, target) => {
+    if (isChatBlocked(conversationId)) throw new ExternalPrimeError('ACCESS_REVOKED', 'External worker is blocked.');
+    const current = externalWorkerGrant(conversationId);
+    if (!current || current.worker.familyId !== owner.familyId || current.worker.runId !== owner.runId ||
+      current.principal.principalId !== owner.principalId || current.principal.policyRevision !== owner.revision || policyIdentity() !== generation) {
+      throw new ExternalPrimeError('ACCESS_REVOKED', 'External worker authority changed while this call was pending.');
+    }
+    const config = getConfig();
+    const caps = effectiveCapabilities(config);
+    if (capabilities?.some(capability => !caps[capability] || !current.principal.capabilities.includes(capability)))
+      throw new ExternalPrimeError('ACCESS_REVOKED', 'The external worker no longer has the required tool permission.');
+    if (target && !config.roots.some(root => current.principal.rootIds.includes(root.name) &&
+      (!target.root || (target.root.name === root.name && target.root.path === root.path)) && isContained(root.path, target.real)))
+      throw new ExternalPrimeError('ACCESS_REVOKED', 'The resolved target is outside the current external worker roots.');
+  };
+}
 
 /** One live policy for worker tool admission and browser placement; no copied grants. */
 export function externalPlacementGrant(principalId: string, placement: import('../agents.js').ExternalFamilyPlacement | null | undefined, setupProfileId: string | null | undefined): ExternalPrincipal {
@@ -18,7 +53,7 @@ export function externalPlacementGrant(principalId: string, placement: import('.
       !principal.rootIds.includes(placement.workspaceRootId) || !config.roots.some(root => root.name === placement.workspaceRootId) ||
       placement.browserBinding.kind !== principal.browserBinding.kind || placement.browserBinding.browserId !== principal.browserBinding.browserId ||
       (principal.setupProfileId !== (config.tunnel.profileId ?? 'default') && !config.setupProfiles?.some(row => row.id === principal.setupProfileId))) {
-    throw new ExternalPrimeError('ACCESS_REVOKED', 'The external worker owner or placement is no longer allowed. No tool was run.');
+    throw new ExternalPrimeError('ACCESS_REVOKED', 'The external worker owner or placement is no longer allowed; further execution is refused.');
   }
   return principal;
 }
@@ -26,6 +61,7 @@ export function externalPlacementGrant(principalId: string, placement: import('.
 /** A proven worker is not an authenticated external transport. */
 export function externalWorkerGrant(conversationId: string | null | undefined): { principal: ExternalPrincipal; worker: WorkerPrimeOwner } | null {
   const worker = conversationId ? workerPrimeOwner(conversationId) : null;
+  if (worker?.owned && !worker.owner) throw new ExternalPrimeError('ACCESS_REVOKED', 'No unique worker owner is proven.');
   if (worker?.owner?.kind !== 'external_principal') return null;
   if (!worker.familyId || !worker.runId) throw new ExternalPrimeError('ACCESS_REVOKED', 'External worker provenance unavailable.');
   return { principal: externalPlacementGrant(worker.owner.principalId, worker.externalPlacement, worker.setupProfileId), worker };

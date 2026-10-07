@@ -9,6 +9,7 @@
 
 import { rawCreateReadStream as createReadStream, rawPromises as fs } from './rawfs.js';
 import { spawn } from 'node:child_process';
+import { assertToolAdmission } from './mcp/call-context.js';
 import path from 'node:path';
 import { locateRipgrep } from './ripgrep.js';
 import { isExcludedFolderName, sniffBinaryBytes, type TextEncoding } from './fsops.js';
@@ -214,6 +215,7 @@ async function searchWithRipgrep(
   args.push('--', req.query, targetIsFile ? realTarget : '.');
 
   return new Promise<SearchOutcome>((resolve, reject) => {
+    assertToolAdmission(['search'], { real: realTarget });
     const child = spawn(executable, args, {
       cwd: targetIsFile ? path.dirname(realTarget) : realTarget,
       windowsHide: true,
@@ -366,6 +368,7 @@ export async function search(req: SearchRequest): Promise<SearchOutcome> {
     directoriesScanned++;
     let directory;
     try {
+      assertToolAdmission(['search'], { real: current.dir });
       directory = await fs.opendir(current.dir);
     } catch {
       continue;
@@ -565,9 +568,11 @@ async function scanOneFile(
     });
   };
 
+  assertToolAdmission(['search'], { real: realPath });
   const stream = createReadStream(realPath, { highWaterMark: 64 * 1024 });
   try {
     for await (const chunk of stream) {
+      assertToolAdmission(['search'], { real: realPath });
       const data = chunk as Buffer;
       if (decoder === null) {
         if (sniffBinaryBytes(data.subarray(0, Math.min(8192, data.length)))) return [];
