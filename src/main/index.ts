@@ -53,6 +53,7 @@ import {
   onRetiredWorkersPersistNow,
   onSwarmPersist,
   onSwarmPersistNow,
+  mutateAgentAuthority,
   pauseSwarmForDisable,
   primeFleetIn, repairPrimeConversationAfterRecovery,
   reconcileAgentRequestOwners,
@@ -483,7 +484,7 @@ void app.whenReady().then(async () => {
   // keeping both sinks wired from startup guarantees the first spawn can cross its durable
   // acceptance barrier even when this launch began with multi-agent disabled.
   onSwarmPersist(() => writeDurableSoon(SWARM_STATE, snapshotSwarm()));
-  onSwarmPersistNow((snapshot) => writeDurableNow(SWARM_STATE, snapshot));
+  onSwarmPersistNow((snapshot, options) => writeDurableNow(SWARM_STATE, snapshot, options));
 
   // A multi-agent run outlives this process. Restoring it before the bridge starts
   // means a worker that never joined gets its chat re-requested through the same queue
@@ -493,7 +494,7 @@ void app.whenReady().then(async () => {
   const retiredWorkers = await readDurable<RetiredWorkersSnapshot>(RETIRED_WORKERS_STATE);
   if (windowActivation.isDisabled()) return;
   restoreRetiredWorkers(retiredWorkers);
-  const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE);
+  const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE, { strict: getConfig().externalPrime.principals.length > 0 });
   if (windowActivation.isDisabled()) return;
   restoreSwarm(savedSwarm);
   if (!getConfig().multiAgent.enabled) {
@@ -501,8 +502,7 @@ void app.whenReady().then(async () => {
     // a crash into stopped prime-owned history before the bridge exists, then make that safer
     // projection durable. Re-enabling later in this process or after another restart recovers the
     // same exact worker conversations without letting disabled workers consume execution slots.
-    pauseSwarmForDisable('multi-agent mode is disabled');
-    await writeDurableNow(SWARM_STATE, snapshotSwarm());
+    await mutateAgentAuthority(() => pauseSwarmForDisable('multi-agent mode is disabled'));
     if (windowActivation.isDisabled()) return;
   }
   // Continuation recovery is after swarm restore because an interrupted durable rebind may

@@ -485,8 +485,10 @@ async function applyOrigin(sessionId: string, conversationId: string): Promise<v
     // Older workers omitted their prime link. Repair only that missing relation from
     // exact broker ownership; keep the user's title and original task unchanged.
     if (summary.origin.kind === 'worker' && origin.kind === 'worker' &&
-        summary.origin.agentId === origin.agentId && !summary.origin.fromSessionId && origin.fromSessionId) {
-      await setSessionOrigin(sessionId, { ...summary.origin, fromSessionId: origin.fromSessionId }, summary.title);
+        summary.origin.agentId === origin.agentId && ((!summary.origin.fromSessionId && origin.fromSessionId) ||
+          (origin.owner && JSON.stringify(summary.origin.owner) !== JSON.stringify(origin.owner)))) {
+      await setSessionOrigin(sessionId, { ...summary.origin, fromSessionId: origin.fromSessionId ?? summary.origin.fromSessionId,
+        ...(origin.owner ? { owner: origin.owner, familyId: origin.familyId } : {}) }, summary.title);
       notifyChanged(sessionId);
     }
     return;
@@ -1471,7 +1473,7 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
         target.conversationId !== null &&
         filed?.conversationId === target.conversationId &&
         !(await conversationWasSuperseded(target.conversationId));
-      attributionListener?.(
+      await attributionListener?.(
         target.conversationId,
         sessionId,
         currentConversation,
@@ -1630,7 +1632,7 @@ let attributionListener:
       requestId: string | null,
       reopenedTurnId: string | null,
       filedSession: SessionSummary | null
-    ) => void)
+    ) => void | Promise<void>)
   | null = null;
 
 export function setCallAttributionListener(
@@ -1646,7 +1648,7 @@ export function setCallAttributionListener(
         /** The turn this call reopened, when it proved the page's completed end false. */
         reopenedTurnId: string | null,
         filedSession: SessionSummary | null
-      ) => void)
+      ) => void | Promise<void>)
     | null
 ): void {
   attributionListener = listen;

@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { CAPABILITIES } from './types.js';
 import { familyIdSchema, principalIdSchema, requestIdSchema, reportIdSchema, receiptIdSchema } from './agent-owner.js';
 
-export const EXTERNAL_PRIME_LIMITS = Object.freeze({ principals: 16, familiesPerPrincipal: 64, ledgerRecordsPerPrincipal: 10000, httpBodyBytes: 256 * 1024, resultFileBytes: 1024 * 1024, resultPageBytes: 16384, reportsDefault: 10, reportsMax: 20, reportsTextChars: 32000, taskChars: 4000 });
+export const EXTERNAL_PRIME_LIMITS = Object.freeze({ principals: 16, familiesPerPrincipal: 64, ledgerRecordsPerPrincipal: 1000, httpBodyBytes: 256 * 1024, resultFileBytes: 1024 * 1024, resultPageBytes: 16384, reportsDefault: 10, reportsMax: 20, reportsTextChars: 32000, taskChars: 4000 });
 /** Existing sandbox virtual root names, not new UUIDs or physical paths. */
 export const workspaceRootIdSchema = z.string().min(1).max(32).regex(/^[a-z0-9][a-z0-9._-]*$/);
 export const setupProfileIdSchema = z.string().min(1).max(64);

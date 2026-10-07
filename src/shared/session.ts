@@ -6,6 +6,8 @@
  * agree on exactly.
  */
 
+import type { AgentOwner, FamilyId, RequestId, ReceiptId } from './agent-owner.js';
+
 /** Where an event came from. The extension is untrusted UI observation; mcp is ours. */
 export type EventSource = 'extension' | 'mcp' | 'app';
 
@@ -573,6 +575,9 @@ export type NewSessionEvent = SessionEvent extends infer Event
  * queued to the conversation that command became.
  */
 export interface SessionOrigin {
+  /** Stable broker provenance; no fabricated ChatGPT parent for external workers. */
+  owner?: AgentOwner;
+  familyId?: FamilyId;
   kind: 'resume' | 'worker' | 'helper' | 'desktop';
   /** The session this chat continues. Null when the source session no longer exists. */
   fromSessionId: string | null;
@@ -878,7 +883,24 @@ export function isReasoningEffort(value: unknown): value is ReasoningEffort {
   return typeof value === 'string' && (REASONING_EFFORTS as readonly string[]).includes(value);
 }
 
+export interface ExternalStopIntent {
+  id: RequestId;
+  ownerRevision: number;
+  runId: string;
+  conversationId: string;
+  turnId?: string;
+  createdAt: number;
+}
+
+export interface ExternalReportDelivery {
+  id: ReceiptId;
+  revision: number;
+  deliveredAt: number;
+  ackedAt?: number;
+}
+
 export interface AgentInfo {
+  externalStopIntent?: ExternalStopIntent;
   /** Broker owner projection. IDs such as worker-1 are local to this incarnation. */
   runId?: string;
   primeConversationId?: string;
@@ -1014,6 +1036,7 @@ export interface AgentInfo {
  * one place where that is unrecoverable rather than merely annoying.
  */
 export interface AgentMessage {
+  externalDelivery?: ExternalReportDelivery;
   id: string;
   from: string;
   to: string;

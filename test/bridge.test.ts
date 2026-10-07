@@ -150,6 +150,7 @@ const {
   pendingWorkerSpawns,
   releaseQuiescentRun,
   onSwarmPersistNow,
+  onRetiredWorkersPersistNow,
   persistCriticalSwarmNow,
   retiredWorkerForConversation,
   resetSwarm,
@@ -359,7 +360,8 @@ beforeAll(async () => {
   initSecretsPath(dir);
   initSessionStore(dir);
   initDurableStore(dir);
-  onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+  onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options));
+  onRetiredWorkersPersistNow(snapshot => writeDurableNow('retired-workers', snapshot));
   const baseConfig = defaultConfig();
   suiteConfig = {
     ...baseConfig,
@@ -4012,7 +4014,9 @@ describe('delivering a bootstrap', () => {
       kind: 'worker',
       fromSessionId: null,
       agentId: 'worker-1',
-      task: 'Keep durable worker attribution'
+      task: 'Keep durable worker attribution',
+      owner: { kind: 'chatgpt_conversation', conversationId: PRIME_CHAT },
+      familyId: currentRunId(PRIME_CHAT)
     });
     expect(summary?.title).toBe('worker-1 · Keep durable worker attribution');
   });
@@ -4328,7 +4332,7 @@ describe('delivering a bootstrap', () => {
       expect(after?.receipts?.some((entry) => entry.id === command.id)).toBe(true);
     } finally {
       release();
-      onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+      onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options));
     }
   });
 
@@ -5270,7 +5274,7 @@ describe('delivering a bootstrap', () => {
 
     // Model the next process attempt from the still-authoritative durable broker snapshot. The
     // same rows are therefore retryable rather than having been half-pruned by the failed start.
-    onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+    onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options));
     resetSwarm();
     restoreSwarm(fixture.durableSwarm);
     resetBridgeForTests();
@@ -5339,7 +5343,7 @@ describe('delivering a bootstrap', () => {
     const after = await readDurable<any>('bridge-commands');
     expect(after?.commands?.some((entry: any) => entry?.id === fixture.revivalId)).toBe(false);
     expect(after?.commands?.some((entry: any) => entry?.id === fixture.resumeId)).toBe(true);
-    onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+    onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options));
   });
 
   it('does not let an older expired disk revival cancel a newer retained wake for the same worker', async () => {
@@ -5924,7 +5928,7 @@ describe('delivering a bootstrap', () => {
       const durableAfter = await readDurable<any>('swarm');
       expect(durableAfter?.agents?.find((agent: any) => agent.info?.id === 'worker-1')?.info?.state).toBe('active');
     } finally {
-      onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+      onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options));
     }
   });
 
@@ -5993,7 +5997,7 @@ describe('delivering a bootstrap', () => {
       expect(ownerState.agents.find((agent) => agent.id === PRIME_ID)?.pending).toBe(1);
     } finally {
       gate.release();
-      onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+      onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options));
     }
   });
 
@@ -6425,6 +6429,8 @@ describe('delivering a bootstrap', () => {
     expect(pendingCommands().some((command) => command.what === `worker:${currentRunId()}:worker-1`)).toBe(false);
     expect(pendingCommands()).toHaveLength(20);
 
+    // Transport retirement is synchronous; its retained broker fence settles in the shared lane.
+    await persistCriticalSwarmNow();
     expect(swarmState().running).toBe(false);
     const worker = swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find((info) => info.id === 'worker-1')!;
     expect(worker.state).toBe('failed');
@@ -6513,7 +6519,7 @@ describe('delivering a bootstrap', () => {
       );
     } finally {
       gate.release();
-      onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+      onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options));
     }
   });
 

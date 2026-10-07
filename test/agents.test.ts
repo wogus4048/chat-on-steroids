@@ -202,7 +202,7 @@ function startSwarm(count = 2, caller: Caller = prime): StartedSwarm {
  * A worker started the way the app makes it happen: the extension reports the chat it
  * opened, and that binding is the whole of it. No join, no key, nothing typed by a model.
  */
-function startWorker(id: string, conversationId = `c-${id}`): { caller: Caller } {
+function startWorker(id: string, conversationId = `c-${id}`): { caller: import('../src/shared/agent-owner.js').ChatGptCaller } {
   expect(bindConversation(id, conversationId)).toBe(true);
   return { caller: { conversationId } };
 }
@@ -1938,7 +1938,7 @@ describe('a worker that is sleeping', () => {
     expect(releaseQuiescentRun()).toBe(true);
 
     const saved = snapshotSwarm()!;
-    expect(saved.version).toBe(7);
+    expect(saved.version).toBe(8);
     expect(saved.runId).toBeNull();
     expect(saved.dormantRuns).toHaveLength(2);
 
@@ -4205,13 +4205,13 @@ describe('through the MCP endpoint', () => {
     expect(offerMessagesForConversation(peer.conversationId)?.messages.map(message => message.text)).toEqual(['audit parser']);
   });
 
-  it('refuses a cross-prime message if its destination disappears during the durable write', async () => {
+  it('fails closed if a persistence callback bypasses the acceptance lane and destroys its destination', async () => {
     spawn({ caller: prime, workers: [{ task: 'A worker' }] });
     const b = spawn({ caller: { conversationId: 'mcp-peer-retired' }, workers: [{ task: 'B worker' }] });
     onSwarmPersistNow(async () => { clearAgent(PRIME_ID, b.runId); });
 
     const failed = await asChat(PRIME_CHAT, 'message', { target_run_id: b.runId, text: 'late handoff' });
-    expect(failed).toContain('TARGET_RUN_UNAVAILABLE: the destination prime family changed before acceptance. Nothing was queued.');
+    expect(failed).toContain('Broker acceptance invariant failed; restart to restore the durable snapshot');
     expect(currentRunId('mcp-peer-retired')).toBeNull();
     expect(swarmStateForCaller(prime).agents.find(agent => agent.id === PRIME_ID)?.pending).toBe(0);
   });

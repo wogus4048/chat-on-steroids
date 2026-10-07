@@ -125,7 +125,7 @@ import {
   clearAgent,
   onSwarmChange,
   pauseSwarmForDisable,
-  persistAgentAuthorityNow,
+  mutateAgentAuthority,
   workerPrimeOwner,
   resetSwarm,
   swarmState
@@ -671,12 +671,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     if (!next.multiAgent.enabled) {
       // Off pauses execution; it is not the destructive Clear swarm action. Preserve every
       // prime-owned worker history so re-enable/restart can still show and revive exact chats.
-      pauseSwarmForDisable();
-      cancelWorkerCommands('multi-agent mode was turned off');
       try {
-        if (!(await persistAgentAuthorityNow())) {
-          throw new Error('Multi-agent teardown has no immediate durable persistence sink.');
-        }
+        await mutateAgentAuthority(() => pauseSwarmForDisable());
+        cancelWorkerCommands('multi-agent mode was turned off');
       } catch (error) {
         authorityPersistError = error instanceof Error ? error : new Error(String(error));
       }
@@ -1557,10 +1554,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
 
   handle('swarm:get', async () => swarmState());
   handle('swarm:reset', async () => {
-    resetSwarm();
-    if (!(await persistAgentAuthorityNow())) {
-      throw new Error('The cleared run could not be made durable. Retry clearing the swarm.');
-    }
+    await mutateAgentAuthority(() => resetSwarm());
     return swarmState();
   });
   /**
@@ -1574,11 +1568,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
    */
   handle('swarm:clearAgent', async (payload) => {
     const { id, runId } = z.object({ id: agentIdArg, runId: z.string().min(1).max(200).optional() }).parse(typeof payload === 'string' ? { id: payload } : payload);
-    const outcome = clearAgent(id, runId);
+    const outcome = await mutateAgentAuthority(() => clearAgent(id, runId));
     if (outcome.cleared !== 'none') {
-      if (!(await persistAgentAuthorityNow())) {
-        throw new Error('The agent clear could not be made durable. Retry the clear action.');
-      }
       if (outcome.cleared === 'worker') cancelWorkerCommands(outcome.reason, id, runId);
     }
     // The prime's report stays in the main process: the renderer needs the outcome, not

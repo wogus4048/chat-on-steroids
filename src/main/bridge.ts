@@ -179,6 +179,10 @@ import { ownCoreHint,
   occupiesSlot,
   sleepWorker,
   stageQueuedWorkerRevivals,
+  acceptStagedSwarmMutation,
+  mutateSwarm,
+  mutateAgentAuthority,
+  workerFamilyOrigin,
   swarmState,
   swarmTransferActive,
   noteAgentAlive,
@@ -1591,7 +1595,10 @@ async function reconcileDeliveredWorkerTurn(id: string, sessionId: string): Prom
       command.createdAt !== createdAt || command.owner !== owner || current?.runId !== worker.runId ||
       current.state !== worker.state || current.sleptAt !== worker.sleptAt ||
       current.lastRevivalCommandId !== worker.lastRevivalCommandId || !revivalDeliveryProven(command)) return false;
-  noteAgentAlive(id, 'turn', start.time);
+  await mutateSwarm(() => {
+    const latest = agentInfoForOwnedConversation(id);
+    if (latest && latest.runId === worker.runId && latest.lastRevivalCommandId === worker.lastRevivalCommandId && commands.includes(command)) noteAgentAlive(id, 'turn', start.time);
+  });
   return true;
 }
 
@@ -1624,26 +1631,24 @@ async function reconcileWorkerFinish(id: string, sessionId: string, observations
   }
   if (!worker || (!retainedTerminalText && !['active', 'detached', 'invited'].includes(worker.state))) return true;
   const finalText = retainedTerminalText ?? await workerFinalAcrossBatches(sessionId, id, observations);
-  const current = agentInfoForOwnedConversation(id);
-  if (!finalText || !current || current.runId !== worker.runId || current.state !== worker.state ||
-      current.sleptAt !== worker.sleptAt || current.lastRevivalCommandId !== worker.lastRevivalCommandId) return true;
-  const staged = stageWorkerConversationFinish(id, finalText);
-  if (!staged?.report) return true;
+  let staged;
   try {
-    if (!(await persistCriticalSwarmNow())) {
-      staged.rollback();
-      return false;
-    }
+    staged = await acceptStagedSwarmMutation(() => {
+      const current = agentInfoForOwnedConversation(id);
+      if (!finalText || !current || current.runId !== worker!.runId || current.state !== worker!.state ||
+          current.sleptAt !== worker!.sleptAt || current.lastRevivalCommandId !== worker!.lastRevivalCommandId) return null;
+      return stageWorkerConversationFinish(id, finalText);
+    });
   } catch (err) {
-    staged.rollback();
     logWarn(`bridge: final state for worker conversation ${id} is not durable yet — ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
-  staged.commit();
+  if (!staged?.report) return true;
+
   await recordAgentMessage(staged.report, 'sent', id);
   if (staged.info.runId) {
     await wakeQueuedStoppedWorkers([worker.id], staged.info.runId);
-    releaseQuiescentRun({}, staged.info.runId);
+    await mutateSwarm(() => releaseQuiescentRun({}, staged!.info.runId));
   }
   return true;
 }
@@ -2698,7 +2703,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const reportedCommandId = typeof body['agentCommandId'] === 'string' ? body['agentCommandId'] : null;
     bindLeasedWorkerCommand(reportedAgent, reportedCommandId, id);
     // This reports attachment only. The recorder below owns actual work and replay deduplication.
-    const revived = noteAgentAlive(id, 'page');
+    const revived = await mutateSwarm(() => noteAgentAlive(id, 'page'));
     if (revived?.report) await recordAgentMessage(revived.report, 'sent', id);
     const observations = parseObservations(body['events']);
     observationWritesInFlight += 1;
@@ -2716,6 +2721,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           const prime = primeForOwnedConversation(id);
           await noteChatOrigin(id, {
             kind: 'worker',
+            ...(worker.runId ? workerFamilyOrigin(worker.runId) : null),
             fromSessionId: prime ? (await findSessionByConversation(prime, { requireUnique: true }))?.id ?? null : null,
             agentId: worker.id,
             task: worker.task
@@ -2726,10 +2732,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const superseded = await conversationWasSuperseded(id);
       if (!superseded && !isChatBlocked(id) && result.activity.working && result.activity.at) {
         const woke = result.activity.startedAt !== undefined
-          ? noteAgentAlive(id, 'turn', result.activity.startedAt)
-          : noteAgentAlive(id, 'output', result.activity.at);
+          ? await mutateSwarm(() => noteAgentAlive(id, 'turn', result.activity.startedAt))
+          : await mutateSwarm(() => noteAgentAlive(id, 'output', result.activity.at));
         if (result.activity.startedAt !== undefined && result.activity.at > result.activity.startedAt)
-          noteAgentAlive(id, 'output', result.activity.at);
+          await mutateSwarm(() => noteAgentAlive(id, 'output', result.activity.at));
         if (woke?.report) await recordAgentMessage(woke.report, 'sent', id);
         if (woke?.revived) tidyCommands();
       }
@@ -2770,7 +2776,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // worker's next sleep or revival.
       if (agent && result.sessionId) {
         const summary = await getSession(result.sessionId).catch(() => null);
-        if (summary) noteAgentContextTokens(id, summary.contextTokens);
+        if (summary) await mutateSwarm(() => noteAgentContextTokens(id, summary.contextTokens));
       }
       // Workers are one-shot jobs. A settled assistant answer is first-hand page evidence that
       // the worker has completed a turn; waiting for the model to make another MCP call solely
@@ -2843,8 +2849,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // done. A Compact & Resume in flight is the one case this does not apply to, and the
       // broker knows that because the continuation pinned the prime binding before the old
       // chat was replaced.
-      if (primeConversationGone(id)) logInfo(`bridge: the prime chat ${id} closed, so its run ended`);
-      else if (workerConversationGone(id)) {
+      if (await mutateAgentAuthority(() => primeConversationGone(id))) logInfo(`bridge: the prime chat ${id} closed, so its run ended`);
+      else if (await mutateSwarm(() => workerConversationGone(id))) {
         logInfo(`bridge: worker chat ${id} closed — its slot is detached, not ended, until it also goes quiet`);
       }
       if (manual) {
@@ -4516,7 +4522,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           workerRevivalDeliveredSince(revive.agent, conversation, command.id, command.claimedAt, revive.runId);
         // The send is an *offer*, not an acknowledgement: the words are in the worker's chat,
         // and the worker's own next authenticated call is what retires them from its inbox.
-        const woke = alreadySent || (revival ? noteWorkerRevived(revive.agent, conversation, revival.messageIds, command.id, revive.runId) : false);
+        const woke = alreadySent || (revival ? await mutateSwarm(() => noteWorkerRevived(revive.agent, conversation, revival.messageIds, command.id, revive.runId)) : false);
         if (woke) {
           receipt = {
             id,
@@ -4536,7 +4542,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           // Only the first two are this revival's to undo. A worker that stopped waking on its
           // own has already been put somewhere by whatever did that, and failWorkerRevival()
           // ignores anything that is not still `waking`, so this cannot invent a failure.
-          failWorkerRevival(revive.agent, why, revive.runId);
+          await mutateSwarm(() => failWorkerRevival(revive.agent, why, revive.runId));
           receipt = {
             id,
             client: client || command.owner,
@@ -4599,7 +4605,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       } else {
         if (!conversation) {
           const why = 'the chat this app opened for it never said which conversation it was';
-          if (agent) failAgent(agent, why, undefined, {}, command.spec.runId);
+          if (agent) { const runId = command.spec.runId; await mutateSwarm(() => failAgent(agent, why, undefined, {}, runId)); }
           receipt = {
             id,
             client: client || command.owner,
@@ -4644,7 +4650,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         const bound = agent ? agentConversation(agent, command.spec.runId) === conversation : false;
         if (!bound) {
           const why = 'the chat this app opened for the worker could not be bound to that slot';
-          if (agent) failAgent(agent, why, undefined, {}, command.spec.runId);
+          if (agent) { const runId = command.spec.runId; await mutateSwarm(() => failAgent(agent, why, undefined, {}, runId)); }
           receipt = {
             id,
             client: client || command.owner,
@@ -4709,7 +4715,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const why = error
         ? `the worker's chat did not take the message — ${error}`
         : "the browser could not reopen the worker's chat";
-      failWorkerRevival(command.spec.agent, why, command.spec.runId);
+      { const spec = command.spec; await mutateSwarm(() => failWorkerRevival(spec.agent, why, spec.runId)); }
       receipt = {
         id,
         client: client || command.owner,
@@ -4721,7 +4727,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       };
     } else {
       const why = error ? `the browser could not start the chat — ${error}` : 'the browser could not start the chat';
-      if (agent) failAgent(agent, why, undefined, {}, command.spec.runId);
+      if (agent) { const runId = command.spec.runId; await mutateSwarm(() => failAgent(agent, why, undefined, {}, runId)); }
       receipt = {
         id,
         client: client || command.owner,
@@ -4791,7 +4797,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // A failed bootstrap/revival can be the transition that frees the final worker slot, and
     // unlike an MCP call there is no dispatcher epilogue after this ACK. Settle the durable
     // command first, then release/park the quiescent active incarnation if no slot is occupied.
-    releaseQuiescentRun();
+    await mutateSwarm(() => releaseQuiescentRun());
     if (status === 'failed' && command.spec.type === 'resume' && projectEntryDetail) {
       logWarn(`bridge: command ${id} failed: project entry ${projectEntryDetail}`);
     }
@@ -4819,21 +4825,11 @@ interface DurableQuiescence {
  * recoverable: rollback leaves the worker sleeping with the original message still unread.
  */
 async function wakeQueuedStoppedWorkers(ids: readonly string[], runId: string): Promise<void> {
-  const staged = stageQueuedWorkerRevivals(ids, runId);
-  if (staged.waking.length === 0) return;
   try {
-    if (!(await persistCriticalSwarmNow())) {
-      staged.rollback();
-      logWarn('multi-agent: queued work could not reserve a durable revival after its worker stopped');
-      return;
-    }
-    staged.commit();
-    requestWorkerRevivals(staged.waking, runId);
+    const staged = await acceptStagedSwarmMutation(() => stageQueuedWorkerRevivals(ids, runId));
+    if (staged.waking.length > 0) requestWorkerRevivals(staged.waking, runId);
   } catch (err) {
-    staged.rollback();
-    logWarn(
-      `multi-agent: queued work could not reserve a durable revival after its worker stopped — ${err instanceof Error ? err.message : String(err)}`
-    );
+    logWarn(`multi-agent: queued work could not reserve a durable revival after its worker stopped — ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -4985,13 +4981,13 @@ async function sweepOwnedSwarm(runId: string, now: number): Promise<boolean> {
         }
       })
   );
-  for (const slept of sleepSilentWorkers(
+  for (const slept of await mutateSwarm(() => sleepSilentWorkers(
     now,
     runId,
     id => runningToolProgress(id) !== null || approvalCardWaiting(id, now),
     id => unresolvedTurns.get(id)?.turnId,
     id => unresolvedTurns.get(id)?.requestOriginMax
-  )) {
+  ))) {
     if (slept.report) await recordAgentMessage(slept.report, 'sent', slept.info.conversationId);
     stoppedWorkers.push(slept.info.id);
   }
@@ -5016,21 +5012,21 @@ async function sweepOwnedSwarm(runId: string, now: number): Promise<boolean> {
     if (proof.lastOutcome === 'completed') {
       // It answered and stopped. Its own last message is the report, exactly as if it had
       // remembered to call finish, and the worker keeps everything it knows.
-      const finished = finishWorkerConversation(
-        worker.conversationId,
+      const finished = await mutateSwarm(() => finishWorkerConversation(
+        worker.conversationId!,
         'Worker turn completed and remained durably inactive for the orphan grace period.'
-      );
+      ));
       if (finished?.report) {
         await recordAgentMessage(finished.report, 'sent', finished.info.conversationId);
         stoppedWorkers.push(worker.id);
       }
     } else {
-      const slept = sleepWorker(
+      const slept = await mutateSwarm(() => sleepWorker(
         worker.id,
         proof.ended
           ? 'Its ChatGPT chat was closed and its work has been durably quiet since.'
           : `Its last ChatGPT turn ended ${proof.lastOutcome ?? 'without a completed outcome'} and it has been durably quiet since.`, runId
-      );
+      ));
       if (slept?.report) {
         await recordAgentMessage(slept.report, 'sent', slept.info.conversationId);
         stoppedWorkers.push(worker.id);
@@ -5041,7 +5037,7 @@ async function sweepOwnedSwarm(runId: string, now: number): Promise<boolean> {
   await wakeQueuedStoppedWorkers(stoppedWorkers, runId);
 
   if (!swarmRunning(runId) || swarmTransferActive(runId) || inFlightMcpRequests() > 0 || observationWritesInFlight > 0) return false;
-  return releaseQuiescentRun({}, runId) || stoppedWorkers.length > 0;
+  return await mutateSwarm(() => releaseQuiescentRun({}, runId)) || stoppedWorkers.length > 0;
 }
 
 // -------------------------------------------------------------------- server
@@ -5624,34 +5620,22 @@ async function persistRevivalRedeem(
     if (command.owner && command.owner !== client) return 'taken';
     if (command.spec.type !== 'revive') return 'stale';
 
-    // Re-check after waiting for a prior redeemer. An MCP call is allowed to win only before
-    // the browser-owned broker claim is installed.
-    const revival = revivalFor(command.spec.agent, command.spec.runId);
-    if (!revival || revival.conversationId !== command.spec.conversationId) return 'stale';
-    if (!claimWorkerRevival(command.spec.agent, command.spec.conversationId, command.spec.runId)) return 'stale';
-
-    let brokerDurable = false;
+    // Command gates precede the broker lane. No command lease write is awaited inside it.
+    const spec = command.spec;
     try {
-      brokerDurable = await persistCriticalSwarmNow();
+      const claim = await acceptStagedSwarmMutation(() => {
+        if (!commands.includes(command) || (command.owner && command.owner !== client)) return null;
+        const revival = revivalFor(spec.agent, spec.runId);
+        if (!revival || revival.conversationId !== spec.conversationId ||
+            !claimWorkerRevival(spec.agent, spec.conversationId, spec.runId)) return null;
+        return {
+          commit: () => undefined,
+          rollback: () => { rollbackWorkerRevivalClaim(spec.agent, spec.conversationId, spec.runId); }
+        };
+      });
+      if (!claim) return 'stale';
     } catch (err) {
-      logWarn(
-        `bridge: could not persist the broker claim for ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-    if (!brokerDurable) {
-      // No browser payload has escaped. Restore the pre-claim arbitration state and supersede
-      // any failed durable generation with that safe snapshot. If storage itself remains down,
-      // the command is still not handed out; a later retry/restart can recover from either safe
-      // durable side without duplicate injection.
-      if (rollbackWorkerRevivalClaim(command.spec.agent, command.spec.conversationId, command.spec.runId)) {
-        try {
-          await persistCriticalSwarmNow();
-        } catch (err) {
-          logWarn(
-            `bridge: could not persist rollback of ${specKey(command.spec)} claim — ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
-      }
+      logWarn(`bridge: could not persist the broker claim for ${specKey(spec)} — ${err instanceof Error ? err.message : String(err)}`);
       return 'broker-not-durable';
     }
 
@@ -8808,7 +8792,18 @@ function retireSpentRepairs(): void {
  * out is kept until exactly this line runs, so that a reload which did not help is not repeated
  * — see `retireSpentRepairs`. This call is the proof that it did help.
  */
-function noteCallAttribution(
+/** The recorder evidence belongs to this exact bound worker incarnation, even after lane wait. */
+function mutateObservedAgent<T>(conversationId: string, mutation: () => T): Promise<T | null> {
+  const observed = agentInfoForOwnedConversation(conversationId);
+  return mutateSwarm(() => {
+    const current = agentInfoForOwnedConversation(conversationId);
+    if (!observed || !current || current.runId !== observed.runId ||
+        current.lastRevivalCommandId !== observed.lastRevivalCommandId) return null;
+    return mutation();
+  });
+}
+
+async function noteCallAttribution(
   conversationId: string | null,
   sessionId: string,
   currentConversation: boolean,
@@ -8818,12 +8813,12 @@ function noteCallAttribution(
   requestId: string | null = null,
   reopenedTurnId: string | null = null,
   filedSession: SessionSummary | null = null
-): void {
+): Promise<void> {
   if (conversationId) {
     // MCP truth can grow while a Pro page emits no new observation. The just-filed
     // canonical summary, not a later browser poll, owns the worker's context meter.
     if (currentConversation && filedSession?.id === sessionId && filedSession.conversationId === conversationId)
-      noteAgentContextTokens(conversationId, filedSession.contextTokens);
+      await mutateObservedAgent(conversationId, () => noteAgentContextTokens(conversationId, filedSession.contextTokens));
     if (currentConversation && !endsActivity) lastAttributedCallAt.set(conversationId, Date.now());
     // The recorder has just withdrawn a completed end the page reported: the same server turn
     // went on calling tools. Whatever Goal was drafting for that end — or had filed as owed —
@@ -8892,7 +8887,7 @@ function noteCallAttribution(
     // A completed tool is real work too. Long-running calls must leave a full quiet
     // window for the model to process their result, without reviving historical finals.
     if (!isChatBlocked(conversationId)) {
-      const alive = noteAgentAlive(conversationId, 'call');
+      const alive = await mutateObservedAgent(conversationId, () => noteAgentAlive(conversationId, 'call'));
       if (alive?.report) void recordAgentMessage(alive.report, 'sent', conversationId)
         .catch(error => logWarn(`agent: could not record resumed work: ${String(error)}`));
     }
@@ -9996,11 +9991,11 @@ function drop(command: Command, why: string): boolean {
   // limit, it held the one in-flight agent-bearing bootstrap so the next worker never
   // opened, it kept the run looking alive to takeover, and the prime went on waiting for
   // a report from a chat that does not exist.
-  if (command.spec.type === 'worker') failAgent(command.spec.agent, why, undefined, {}, command.spec.runId);
+
   // A revival that never happened is not a worker that failed. Nothing was typed into its
   // chat, so it goes back to sleeping with its inbox intact and its slot released, and the
   // prime is told the message it sent is still waiting to be delivered.
-  if (command.spec.type === 'revive') failWorkerRevival(command.spec.agent, why, command.spec.runId);
+
   logWarn(`bridge: gave up on ${specKey(command.spec)} — ${why}`);
   changed();
   persistCommands();
@@ -10008,9 +10003,13 @@ function drop(command: Command, why: string): boolean {
   // command is no longer deliverable, let the broker release/park the active incarnation if
   // every worker is now stopped. Any sibling bootstrap/revival still in flight occupies a slot
   // and makes this a no-op.
-  releaseQuiescentRun();
   if (needsBrokerFence) {
-    void persistCriticalSwarmNow()
+    void mutateSwarm(() => {
+      if (command.spec.type === 'worker') failAgent(command.spec.agent, why, undefined, {}, command.spec.runId);
+      if (command.spec.type === 'revive') failWorkerRevival(command.spec.agent, why, command.spec.runId);
+      releaseQuiescentRun();
+      return true;
+    })
       .then((durable) => {
         if (!durable) {
           logWarn(
@@ -10116,6 +10115,7 @@ async function commandOrigin(id: string): Promise<SessionOrigin | null> {
   if (spec.type === 'worker')
     return {
       kind: 'worker',
+      ...workerFamilyOrigin(spec.runId),
       fromSessionId: swarmRunning(spec.runId) && primeConversation(spec.runId)
         ? (await findSessionByConversation(primeConversation(spec.runId)!, { requireUnique: true }))?.id ?? null : null,
       agentId: spec.agent,
@@ -10477,7 +10477,10 @@ export async function restoreCommands(): Promise<void> {
         (entry) => entry.id === revive.agent && entry.conversationId === revive.conversationId && entry.runId === revive.runId
       );
       if (!owed) continue;
-      failWorkerRevival(revive.agent, 'its durable revival expired while the app was not running', revive.runId);
+      await mutateSwarm(() => {
+        failWorkerRevival(revive.agent, 'its durable revival expired while the app was not running', revive.runId);
+        releaseQuiescentRun();
+      });
     }
 
     if (brokerRelevant) {
@@ -10526,7 +10529,7 @@ export async function restoreCommands(): Promise<void> {
   // Recovery may have just turned the last expired `waking` worker back into a stopped worker.
   // Do not resurrect the old global active claim merely because no request exists yet to run
   // the usual dispatcher/stale-sweep release hook.
-  releaseQuiescentRun();
+  await mutateSwarm(() => releaseQuiescentRun());
 }
 
 /** Test seam. */

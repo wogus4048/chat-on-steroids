@@ -12,6 +12,7 @@
  * call sees its own store, and code running outside a call sees nothing at all.
  */
 
+import type { ChatGptCaller } from '../../shared/agent-owner.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AssetRef, FileChange, RunningToolActivity, ToolOutcome } from '../../shared/session.js';
 import type { OutputPublication, ProcessCompletion } from '../codex/unified-exec.js';
@@ -43,7 +44,7 @@ export interface CallEvidence {
  * secret in it: identity here is a conversation id gathered from page evidence, which the
  * recorder writes down on purpose.
  */
-export interface CallCaller {
+export interface CallCaller extends ChatGptCaller {
   transportKey: string | null;
   /**
    * Local Setup profile that owns the MCP endpoint generation which accepted this call.
@@ -281,7 +282,7 @@ export function currentAgent(): string | null {
 
 /** Who the running call was proven to be. Empty outside a call. */
 export function currentCaller(): CallCaller {
-  return storage.getStore()?.caller ?? { transportKey: null, requestId: null, conversationId: null };
+  return storage.getStore()?.caller ?? { kind: 'chatgpt', transportKey: null, requestId: null, conversationId: null };
 }
 
 /** Asks for `agent` to be bound to this call's conversation once it can be identified. */

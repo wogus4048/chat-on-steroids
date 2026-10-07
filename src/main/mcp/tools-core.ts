@@ -121,6 +121,8 @@ import {
   stageMessages,
   stagePrimeMessage,
   stageSpawn,
+  acceptStagedSwarmMutation,
+  mutateSwarm,
   swarmRunning,
   swarmStateForCaller,
   type Caller
@@ -1170,7 +1172,7 @@ async function measureSleepingWorkers(caller: Caller): Promise<void> {
   for (const info of state.agents) {
     if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
     const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
-    if (summary) noteAgentContextTokens(info.conversationId, summary.contextTokens);
+    if (summary) await mutateSwarm(() => noteAgentContextTokens(info.conversationId, summary.contextTokens));
   }
   // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
   // authority and can terminalize a parked worker. `status` also calls this helper, so there is
@@ -1188,23 +1190,14 @@ async function measureSleepingWorkers(caller: Caller): Promise<void> {
 }
 
 /** Publish a staged broker mutation only after its exact revision is durable. */
-async function acceptAgentMutation(
-  staged: { commit(): void | boolean; rollback(): void },
+async function acceptAgentMutation<T extends { commit(): void | boolean; rollback(): void }>(
+  factory: () => T,
   failure: string,
   commitFailure: string = failure
-): Promise<void> {
-  try {
-    let durable: boolean;
-    try {
-      durable = await persistCriticalSwarmNow();
-    } catch (error) {
-      throw new Error(`${failure} (${error instanceof Error ? error.message : String(error)})`);
-    }
-    if (!durable) throw new Error(failure);
-    if (staged.commit() === false) throw new Error(commitFailure);
-  } catch (error) {
-    staged.rollback();
-    throw error;
+): Promise<T> {
+  try { return await acceptStagedSwarmMutation(factory, { commitFailure }); }
+  catch (error) {
+    throw new Error(`${failure} (${error instanceof Error ? error.message : String(error)})`);
   }
 }
 
@@ -1328,12 +1321,12 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           // Reserve under exact chat proof or the permitted transport request, atomically.
           // The request remains the reachable prime before browser attachment; later proof
           // changes its frontend projection without recreating workers or replaying spawn.
-          const staged = stageSpawn({
-            workers: input.workers,
+          const caller = await callerNow(startedAt, { exact: true, runId: input.run_id });
+          const staged = await acceptAgentMutation(() => stageSpawn({
+            workers: input.workers!,
             context: input.context ?? null,
-            caller: await callerNow(startedAt, { exact: true, runId: input.run_id })
-          });
-          await acceptAgentMutation(staged,
+            caller
+          }),
             'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.');
           const { created, becamePrime, runId, defaultNotes } = staged;
           if (currentCall()) currentCall()!.caller.runId = runId;
@@ -1383,8 +1376,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               return fail('agents action=message with target_run_id requires text.');
             }
             const caller = await callerNow(startedAt, { runId: input.run_id, member: true });
-            const staged = stagePrimeMessage(caller, input.target_run_id, input.text);
-            await acceptAgentMutation(staged,
+            const staged = await acceptAgentMutation(() => stagePrimeMessage(caller, input.target_run_id!, input.text!),
               'The prime message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.',
               'TARGET_RUN_UNAVAILABLE: the destination prime family changed before acceptance. Nothing was queued.');
             if (currentCall()) currentCall()!.caller.runId = staged.sourceRunId;
@@ -1421,8 +1413,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           await measureSleepingWorkers(caller);
           // One call, one identity resolution, one all-or-nothing delivery: a prime
           // redirecting its whole run cannot end up with two of its three messages sent.
-          const staged = stageMessages(caller, items);
-          await acceptAgentMutation(staged,
+          const staged = await acceptAgentMutation(() => stageMessages(caller, items),
             'The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.');
           const sent = staged.messages;
           const woken = staged.waking;
@@ -1459,11 +1450,9 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               'agents action=finish requires result: the report the prime reads in your place — what you changed, what you verified and what is left. Send it as result and call finish again.'
             );
           }
-          const staged = stageFinishAgent(await callerNow(startedAt, { runId: input.run_id, member: true }), input.result);
-          if (!staged.repeat) {
-            await acceptAgentMutation(staged,
-              'The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result.');
-          }
+          const caller = await callerNow(startedAt, { runId: input.run_id, member: true });
+          const staged = await acceptAgentMutation(() => stageFinishAgent(caller, input.result!),
+            'The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result.');
           const { info, report, repeat } = staged;
           if (report) await recordAgentMessage(report, 'sent', info.conversationId);
           // A retry is answered as a retry. Repeating "marked finished" would read as a
@@ -1601,7 +1590,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
  * The proven identity is then adopted for the rest of the call, so this result is recorded
  * against the right agent and carries the right inbox.
  */
-async function callerNow(startedAt: number, options: { exact?: boolean; runId?: string; member?: boolean } = {}): Promise<Caller> {
+async function callerNow(startedAt: number, options: { exact?: boolean; runId?: string; member?: boolean } = {}): Promise<import('../../shared/agent-owner.js').ChatGptCaller> {
   const base = currentCaller();
   // `exact` marks the one action that binds a run: spawn. It is the call whose refusal the
   // model cannot absorb, so it gets the longer ceiling; every other `agents` action can be
@@ -1618,7 +1607,8 @@ async function callerNow(startedAt: number, options: { exact?: boolean; runId?: 
       // outright, so two workers calling at the same moment are no longer a hard case.
       requestId: base.requestId
     }));
-  const caller: Caller = {
+  const caller: import('../../shared/agent-owner.js').ChatGptCaller = {
+    kind: 'chatgpt',
     ...base,
     conversationId: resolved,
     runId: options.runId

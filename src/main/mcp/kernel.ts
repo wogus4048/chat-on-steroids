@@ -70,12 +70,13 @@ import {
   agentForFinishCaller,
   hasRetiredWorkerLeases,
   offerMessagesForCaller,
-  persistCriticalSwarmNow,
   workerPrimeOwner,
   requestWorkerRevivals,
   releaseQuiescentRun,
   retiredWorkerForConversation,
   stageQueuedWorkerRevivals,
+  acceptStagedSwarmMutation,
+  mutateSwarm,
   swarmRunning
 } from '../agents.js';
 import type { SurfaceId } from './surfaces.js';
@@ -644,7 +645,7 @@ export async function dispatch(
     allowUnattributed: getConfig().multiAgent.allowUnattributedCalls,
     caller: parent
       ? { ...parent.caller }
-      : { transportKey, requestId, conversationId: null, sessionId: null, setupProfileId },
+      : { kind: 'chatgpt', transportKey, requestId, conversationId: null, sessionId: null, setupProfileId },
     outcome: null,
     evidence: emptyEvidence()
   };
@@ -846,20 +847,20 @@ async function dispatchTracked(
     }
     if (!recovered && !isFinish) reactivateDormantRunForConversation(conversationId);
   }
-  const alive = supersededConversation || conversationPolicyRefusal ? null : noteAgentAlive(context.caller.conversationId);
+  const alive = supersededConversation || conversationPolicyRefusal ? null : await mutateSwarm(() => noteAgentAlive(context.caller.conversationId));
   const callerSession = !supersededConversation && !conversationPolicyRefusal && context.caller.conversationId
     ? await findSessionByConversation(context.caller.conversationId, { requireUnique: true }).catch(() => null)
     : null;
   const callerRequestOriginMax = callerSession && context.caller.conversationId
     ? await requestTurnOwnershipCutoff(callerSession.id, context.caller.conversationId).catch(() => null)
     : null;
-  const quietWorkers = supersededConversation || conversationPolicyRefusal ? [] : sleepSilentWorkers(
+  const quietWorkers = supersededConversation || conversationPolicyRefusal ? [] : await mutateSwarm(() => sleepSilentWorkers(
     Date.now(),
     undefined,
     id => runningToolProgress(id) !== null,
     id => callerSession?.conversationId === id ? callerSession.activeTurnId ?? null : undefined,
     id => callerSession?.conversationId === id ? callerRequestOriginMax : undefined
-  );
+  ));
   for (const quiet of quietWorkers) {
     if (quiet.report) await recordAgentMessage(quiet.report, 'sent', quiet.info.conversationId);
   }
@@ -879,24 +880,14 @@ async function dispatchTracked(
     quietByRun.set(runId, [...(quietByRun.get(runId) ?? []), entry.info.id]);
   }
   for (const [runId, ids] of quietByRun) {
-    const deferredWake = stageQueuedWorkerRevivals(ids, runId);
-    if (deferredWake.waking.length > 0) {
-      try {
-        if (await persistCriticalSwarmNow()) {
-          deferredWake.commit();
-          requestWorkerRevivals(deferredWake.waking, runId);
-        } else {
-          deferredWake.rollback();
-          logWarn('multi-agent: could not durably reserve queued work for a worker that just fell asleep');
-        }
-      } catch (err) {
-        deferredWake.rollback();
-        logWarn(
-          `multi-agent: could not durably reserve queued work for a worker that just fell asleep — ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
+    try {
+      const deferredWake = await acceptStagedSwarmMutation(() => stageQueuedWorkerRevivals(ids, runId));
+      if (deferredWake.waking.length > 0) requestWorkerRevivals(deferredWake.waking, runId);
+    } catch (err) {
+      logWarn(`multi-agent: could not durably reserve queued work for a worker that just fell asleep — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+
   context.agent = isFinish ? agentForFinishCaller(context.caller) : agentForCaller(context.caller);
   const retiredWorker = retiredWorkerForConversation(context.caller.conversationId);
   // A ceiling-silenced worker is deliberately neither reusable nor terminal. The only ordinary
@@ -1169,9 +1160,9 @@ async function dispatchTracked(
   // receive its inbox. Doing it inside acknowledgeOffers would let `agents status` destroy
   // the run halfway through identifying itself; here the handler and result are already done.
   const callerRunId = currentRunForCaller(context.caller);
-  if (!deliveryFenced && callerRunId) releaseQuiescentRun({}, callerRunId);
+  if (!deliveryFenced && callerRunId) await mutateSwarm(() => releaseQuiescentRun({}, callerRunId));
   else if (!deliveryFenced && !context.caller.runId) {
-    for (const family of agentFamiliesForCaller(context.caller)) if (family.running) releaseQuiescentRun({}, family.run_id);
+    for (const family of agentFamiliesForCaller(context.caller)) if (family.running) await mutateSwarm(() => releaseQuiescentRun({}, family.run_id));
   }
   markTiming('recorder', true);
   return delivered;

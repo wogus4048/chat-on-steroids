@@ -27,6 +27,8 @@ interface PendingWrite {
   snapshot?: () => unknown;
   background?: boolean;
   work?: Promise<void>;
+  retry?: boolean;
+  invalidated?: boolean;
 }
 
 const pending = new Map<string, PendingWrite>();
@@ -44,13 +46,14 @@ function fileFor(name: string): string {
   return path.join(root, `${name}.json`);
 }
 
-export async function readDurable<T>(name: string): Promise<T | null> {
+export async function readDurable<T>(name: string, options: { strict?: boolean } = {}): Promise<T | null> {
   if (!root) return null;
   try {
     const raw = await fs.readFile(fileFor(name), 'utf8');
     return JSON.parse(raw) as T;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
+    if (options.strict && code !== 'ENOENT') throw err;
     if (code && code !== 'ENOENT') {
       logWarn(`could not read ${name} state: ${(err as Error).message}`);
     }
@@ -74,6 +77,7 @@ function enqueue(name: string, write: () => Promise<void>): Promise<void> {
 }
 
 function enqueueSlot(name: string, slot: PendingWrite): Promise<void> {
+  if (slot.invalidated) return Promise.resolve();
   if (slot.work) return slot.work;
   const work = enqueue(name, () => flushOne(name, slot));
   slot.work = work;
@@ -103,6 +107,7 @@ function scheduleRetry(name: string): void {
 }
 
 async function flushOne(name: string, slot: PendingWrite): Promise<void> {
+  if (slot.invalidated) return;
   if (slot.background && pending.get(name) !== slot) return;
   const target = fileFor(name);
   const tmp = `${target}.tmp`;
@@ -121,6 +126,12 @@ async function flushOne(name: string, slot: PendingWrite): Promise<void> {
       await fs.rename(tmp, target);
     }
   } catch (err) {
+    // Speculative broker proposals cease to exist on failure. Invalidate at the I/O
+    // boundary, before promise continuations can admit a concurrent flush of this slot.
+    if (slot.retry === false) {
+      slot.invalidated = true;
+      if (pending.get(name) === slot) pending.delete(name);
+    }
     logWarn(`could not save ${name} state: ${(err as Error).message}`);
     throw err;
   }
@@ -155,7 +166,7 @@ export function writeDurableSnapshotSoon(name: string, snapshot: () => unknown):
  * snapshot is correct for ordinary progress, but cannot close a crash window between two
  * files when recovery needs to know which side of the boundary the process reached.
  */
-export async function writeDurableNow(name: string, value: unknown): Promise<void> {
+export async function writeDurableNow(name: string, value: unknown, options: { retry?: boolean } = {}): Promise<void> {
   if (!root) return;
   const timer = timers.get(name);
   if (timer) {
@@ -163,6 +174,7 @@ export async function writeDurableNow(name: string, value: unknown): Promise<voi
     timers.delete(name);
   }
   const slot = nextWrite(value);
+  slot.retry = options.retry;
   pending.set(name, slot);
   try {
     // Flush this exact generation even if a newer debounced value arrives while it waits in

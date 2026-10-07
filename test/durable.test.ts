@@ -170,3 +170,39 @@ describe('durable state commit boundary', () => {
     await expect(readDurable('continuations')).resolves.toEqual({ token: 'safe' });
   });
 });
+
+it('invalidates a failed speculative generation before concurrent flush can retry it', async () => {
+  await tempStore();
+  let release!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const rename = vi.spyOn(fs, 'rename').mockImplementationOnce(async () => {
+    entered(); await gate; throw new Error('speculative failure');
+  });
+  const proposal = writeDurableNow('proposal', { accepted: true }, { retry: false });
+  const observed = proposal.catch(error => error);
+  await started;
+  const concurrent = flushDurable().catch(error => error);
+  release();
+  expect(await observed).toMatchObject({ message: 'speculative failure' });
+  await concurrent;
+  await flushDurable();
+  expect(rename).toHaveBeenCalledTimes(1);
+  expect(await readDurable('proposal')).toBeNull();
+  writeDurableSoon('proposal', { accepted: false });
+  await flushDurable();
+  expect(await readDurable('proposal')).toEqual({ accepted: false });
+});
+
+it('strict reads distinguish missing state from corrupt or unreadable authority without replacing it', async () => {
+  const dir = await tempStore();
+  expect(await readDurable('swarm', { strict: true })).toBeNull();
+  await fs.mkdir(path.join(dir, 'state'), { recursive: true });
+  await fs.writeFile(path.join(dir, 'state/swarm.json'), '{broken');
+  await expect(readDurable('swarm', { strict: true })).rejects.toThrow();
+  expect(await readDurable('swarm')).toBeNull();
+  expect(await fs.readFile(path.join(dir, 'state/swarm.json'), 'utf8')).toBe('{broken');
+  vi.spyOn(fs, 'readFile').mockRejectedValueOnce(Object.assign(new Error('denied'), { code: 'EACCES' }));
+  await expect(readDurable('swarm', { strict: true })).rejects.toThrow('denied');
+});
