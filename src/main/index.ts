@@ -1,3 +1,5 @@
+import './dev-profile.js';
+import { devRoot } from './dev-profile.js';
 import { stopInputStartup } from './session/start-input.js';
 import { browserExtensionRequired } from '../shared/types.js';
 import { requestSessionFinishGoal, setFinishNotifier } from './session/finish.js';
@@ -425,7 +427,7 @@ void app.whenReady().then(async () => {
   for (const surface of await enrolledPluginSurfaces()) notePluginInstalled(surface);
   await pluginManager.initialize(userData);
   if (windowActivation.isDisabled()) return;
-  try { applyLoginStartup(app, getConfig().ui.startAtLogin === true); }
+  try { if (!devRoot) applyLoginStartup(app, getConfig().ui.startAtLogin === true); }
   catch (error) { logWarn(`Windows login startup: ${error instanceof Error ? error.message : String(error)}`); }
   // The renderer has its own explicit light/dark palette, so native chrome must follow the same
   // user choice instead of Electron's default `system` theme. On macOS this controls the window
@@ -471,6 +473,7 @@ void app.whenReady().then(async () => {
   // a browser without this extension in it — from the one holding chat A. That decision belongs
   // to the browser that owns the source chat; see bridge.ts::offerPlacement.
   setBrowserOpener(async (url) => {
+    if (devRoot) throw new Error('Automatic browser launch is disabled in Titan development.');
     // Let the command owner report launch failure; another browser may belong to another account.
     await openInPreferredBrowser(url);
   });
@@ -576,20 +579,20 @@ void app.whenReady().then(async () => {
   // The CoS browser starts once the bridge listens: its extension looks for the app as soon as it
   // loads, and a miss would leave it waiting for its next retry.
   if (browserExtensionRequired(getConfig())) {
-    void startBridge().finally(() => void syncCosBrowser());
-  } else void syncCosBrowser();
+    void startBridge().finally(() => { if (!devRoot) void syncCosBrowser(); });
+  } else if (!devRoot) void syncCosBrowser();
   // Opt-in, and only once every fact it projects has been restored. ipc.ts starts and stops it
   // when the setting changes; a failed bind is logged and leaves the rest of the app untouched.
   if (getConfig().controlApi.enabled) {
     startControlApi().catch((error: Error) => logWarn(`control API did not start: ${error.message}`));
   }
-  if (getConfig().ui.autoConnect) void connect();
+  if (!devRoot && getConfig().ui.autoConnect) void connect();
 
   // Never awaited: an unreachable GitHub, a slow download or a broken release must not delay a
   // window that is already on screen. Everything it learns arrives through the ordinary state
   // push, every failure ends inside it, and its own timer keeps it running for a tray app that
   // is never restarted.
-  startUpdateChecks();
+  if (!devRoot) startUpdateChecks();
   // Warm the existing derived cache once, after startup, without delaying the UI.
   // A visit to Usage joins this same calculation; unchanged recordings cost no reads.
   void usageOverview(usageWarmup.signal).catch((error: Error) => {
@@ -655,7 +658,7 @@ app.on('will-quit', (event) => {
       // staged update is handed to the platform's installer here, so the next start of the app
       // is the new version. Nothing is staged unless it downloaded whole and matched the
       // release's published SHA-256, and applying it cannot fail loudly - see update.ts.
-      { name: 'update handoff', budgetMs: 5_000, run: () => [applyStagedUpdate()] }
+      { name: 'update handoff', budgetMs: 5_000, run: () => devRoot ? [] : [applyStagedUpdate()] }
     ],
     {
       info: logInfo,

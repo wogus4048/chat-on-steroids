@@ -58,6 +58,7 @@ import { blockedChatIds, isChatBlocked, chatBlockedAt } from './session/blocked-
 export { CHAT_ACTIVE_MS, CHAT_SILENCE_MS } from '../shared/session.js';
 import { effectiveCapabilities, getConfig, updateConfig } from './config.js';
 import { BROWSER_BRIDGE_PORTS } from '../shared/browser-bridge.js';
+import { readDevBinding } from './dev-profile.js';
 import { bridgePortSelection } from './bridge-ports.js';
 import type { Config } from '../shared/types.js';
 import type { PluginSurface } from '../shared/plugin-refresh.js';
@@ -2103,7 +2104,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!origin) return json(res, 403, { error: 'forbidden_origin' }, null);
     res.writeHead(204, {
       'access-control-allow-origin': origin,
-      'access-control-allow-headers': 'authorization, content-type, x-extension-version, x-extension-protocol, x-extension-build, x-extension-browser, x-extension-host',
+      'access-control-allow-headers': 'authorization, content-type, x-extension-version, x-extension-protocol, x-extension-build, x-extension-browser, x-extension-host, x-titan-instance',
       'access-control-allow-methods': 'GET, POST, OPTIONS',
       // Chrome asks for this before letting an extension reach a loopback address.
       'access-control-allow-private-network': 'true',
@@ -2115,6 +2116,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
   if (!originAllowed) return json(res, 403, { error: 'forbidden_origin' }, null);
 
+  const development = readDevBinding();
+  // Binding selects this development runtime. Bearer authorization remains independent.
+  if (development && route !== '/hello' && req.headers['x-titan-instance'] !== development.instanceId)
+    return json(res, 403, { error: 'wrong_development_instance' }, origin);
+
   noteExtensionVersion(req);
 
   // Identification only. Deliberately says nothing about roots, permissions or state.
@@ -2125,6 +2131,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       200,
       {
         app: 'chat-on-steroids',
+        ...(development ? { instanceId: development.instanceId } : {}),
         version: APP_VERSION,
         bridge: BRIDGE_PROTOCOL,
         // Unknown, not incompatible, for a caller that states no protocol (curl in a bug report).

@@ -27,6 +27,8 @@ import './i18n.js';
 
 const activeTabs = globalThis.chrome?.debugger ? createActiveTabs(chrome) : null;
 
+// Only the isolated extension copy materialized by Titan replaces this binding.
+const DEV_BINDING = null;
 const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -1025,7 +1027,8 @@ async function hello(candidate) {
     }, HELLO_TIMEOUT_MS);
     if (!response.ok) return null;
     const body = await response.json();
-    return body && body.app === 'chat-on-steroids' ? body : null;
+    return body && body.app === 'chat-on-steroids' &&
+      (!DEV_BINDING || body.instanceId === DEV_BINDING.instanceId) ? body : null;
   } catch {
     return null;
   }
@@ -1061,6 +1064,7 @@ function versionHeaders() {
   return {
     'x-extension-version': version,
     'x-extension-protocol': String(BRIDGE_PROTOCOL),
+    ...(DEV_BINDING ? { 'x-titan-instance': DEV_BINDING.instanceId } : {}),
     ...(workerStampValue ? { 'x-extension-build': workerStampValue } : {}),
     ...(browserId ? { 'x-extension-browser': browserId } : {}),
     // The app tells the person's own browser apart from the CoS browser's copy of this extension.
@@ -1086,8 +1090,9 @@ function discover(force = false) {
 
 async function discoverNow(force) {
   await load();
+  if (DEV_BINDING && port !== DEV_BINDING.port) { port = null; portCheckedAt = 0; token = null; }
   if (port !== null && !force) {
-    if (Date.now() - portCheckedAt < PORT_TRUST_MS) return { port, paired: token !== null, compatible: portCompatible !== false, version: appVersion, bridge: appProtocol };
+    if (!DEV_BINDING && Date.now() - portCheckedAt < PORT_TRUST_MS) return { port, paired: token !== null, compatible: portCompatible !== false, version: appVersion, bridge: appProtocol };
     const body = await hello(port);
     if (body) {
       if (body.disconnected === true) await latchAppDisconnect();
@@ -1098,7 +1103,7 @@ async function discoverNow(force) {
       return { port, paired: body.paired === true, compatible: portCompatible, version: appVersion, bridge: appProtocol };
     }
   }
-  for (const candidate of PORTS) {
+  for (const candidate of DEV_BINDING ? [DEV_BINDING.port] : PORTS) {
     const body = await hello(candidate);
     if (body) {
       if (body.disconnected === true) await latchAppDisconnect();

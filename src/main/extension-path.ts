@@ -19,6 +19,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -28,6 +29,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { app } from 'electron';
+import { readDevBinding } from './dev-profile.js';
 
 const MATERIALIZED_FINGERPRINT = '.chat-on-steroids-source';
 const PUBLISH_LAST = new Set(['manifest.json', MATERIALIZED_FINGERPRINT]);
@@ -266,6 +268,32 @@ function materializePackagedExtension(bundled: string, stable: string): string |
  * extension folder — so the checkout path is what answers there.
  */
 export function extensionDir(): string | null {
+  const development = readDevBinding();
+  if (development) {
+    if (app.isPackaged) throw new Error('Titan development extension is forbidden in packaged applications.');
+    const source = path.join(app.getAppPath(), 'extension');
+    const target = path.join(development.root, 'extension');
+    if (path.relative(source, target) === '' || !path.relative(source, target).startsWith('..'))
+      throw new Error('Titan extension copy must be outside the source extension.');
+    mkdirSync(development.root, { recursive: true });
+    const prepared = mkdtempSync(path.join(development.root, '.extension-source-'));
+    try {
+      cpSync(source, prepared, { recursive: true, force: true });
+      const background = path.join(prepared, 'background.js');
+      const code = readFileSync(background, 'utf8');
+      if (!code.includes('const DEV_BINDING = null;')) throw new Error('Development binding marker missing.');
+      writeFileSync(background, code.replace('const DEV_BINDING = null;',
+        `const DEV_BINDING = ${JSON.stringify({ port: development.port, instanceId: development.instanceId })};`));
+      // Reuse the existing transactional publication: a running companion must never see
+      // an unbound background worker between copying upstream files and adding the binding.
+      const expected = extensionFingerprint(prepared);
+      const result = materializePackagedExtension(prepared, target);
+      if (!result || materializedFingerprint(result) !== expected) throw new Error('Development extension publication failed.');
+      return result;
+    } finally {
+      rmSync(prepared, { recursive: true, force: true });
+    }
+  }
   if (app.isPackaged) {
     const bundled = path.join(process.resourcesPath, 'extension');
     const stable = path.join(app.getPath('userData'), 'extension');
