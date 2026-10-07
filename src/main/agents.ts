@@ -961,10 +961,14 @@ export function reconcileAgentRequestOwners(): Promise<void> {
       let attached = false;
       for (const owner of allFamilies()) {
         if (owner.owner.kind === 'external_principal' || owner.primeConversationId || !owner.primeRequestId || unpublishedRuns.has(owner as Run)) continue;
-        const proof = requestCorrelation(owner.primeRequestId);
+        const requestId = owner.primeRequestId;
+        const proof = requestCorrelation(requestId);
         if (!proof) continue;
         const session = await getSession(proof.sessionId);
         if (!session?.conversationId || !session.chatIds.includes(proof.conversationId)) continue;
+        // Invalidate the evidence walk if any queued broker mutation changes authority
+        // before publication; rebuild outside the lane rather than trust an old parent link.
+        const plannedRevision = criticalMutationRevision;
         let target = session.conversationId;
         let targetSessionId = session.id;
         // Existing worker custody outranks a provisional prime. Walk only actual broker
@@ -990,20 +994,26 @@ export function reconcileAgentRequestOwners(): Promise<void> {
         }
         if (epoch !== requestOwnerEpoch) return;
         if (externalRoot) {
-          // Exact worker membership established this custody, not request text or a null
-          // conversation projection. No await separates this final check from publication.
-          if (!allFamilies().includes(owner) || owner.owner.kind !== 'chatgpt_request' ||
-              !allFamilies().includes(externalRoot) || externalRoot.owner.kind !== 'external_principal' ||
-              unpublishedRuns.has(owner as Run)) continue;
-          owner.owner = { ...externalRoot.owner };
-          owner.setupProfileId = externalRoot.setupProfileId;
-          owner.externalPlacement = externalRoot.externalPlacement;
-          owner.primeRequestId = undefined;
-          owner.primeConversationId = null;
-          owner.agents.get(PRIME_ID)!.info.conversationId = null;
-          for (const agent of owner.agents.values()) agent.info.primeConversationId = undefined;
-          attached = true;
-          changed();
+          // Recheck exact proof and every captured parent after waiting for the shared lane.
+          await mutateSwarm(() => {
+            if (plannedRevision !== criticalMutationRevision) { requestOwnerRecoveryAgain = true; return; }
+            if (!allFamilies().includes(owner) || owner.owner.kind !== 'chatgpt_request' ||
+                !allFamilies().includes(externalRoot) || externalRoot.owner.kind !== 'external_principal' ||
+                unpublishedRuns.has(owner as Run) || epoch !== requestOwnerEpoch || owner.primeRequestId !== requestId ||
+                requestCorrelation(requestId)?.conversationId !== proof.conversationId ||
+                requestCorrelation(requestId)?.sessionId !== proof.sessionId ||
+                [...parentBindings].some(([parent, binding]) => !allFamilies().includes(parent) || parent.primeConversationId !== binding) ||
+                ![...externalRoot.agents.values()].some(agent => agent.info.role === 'worker' && agent.info.conversationId === target)) return;
+            owner.owner = { ...externalRoot.owner };
+            owner.setupProfileId = externalRoot.setupProfileId;
+            owner.externalPlacement = externalRoot.externalPlacement ? structuredClone(externalRoot.externalPlacement) : undefined;
+            owner.primeRequestId = undefined;
+            owner.primeConversationId = null;
+            owner.agents.get(PRIME_ID)!.info.conversationId = null;
+            for (const agent of owner.agents.values()) agent.info.primeConversationId = undefined;
+            attached = true;
+            changed();
+          });
           continue;
         }
         if (!target || retiredWorkerForConversation(target) || !allFamilies().includes(owner) ||
@@ -1030,28 +1040,37 @@ export function reconcileAgentRequestOwners(): Promise<void> {
         if (!latest) continue;
         if (latest.conversationId !== session.conversationId || [...parentBindings].some(([parent, binding]) =>
           !allFamilies().includes(parent) || parent.primeConversationId !== binding)) { requestOwnerRecoveryAgain = true; continue; }
-        if (!allFamilies().includes(owner) || owner.primeConversationId || isWorkerConversation(target)) continue;
-        const handoff = continuationForSession(targetSessionId);
-        // The durable session can already name B while the same handoff still owns the
-        // broker's A -> B publication. Join its source projection so that publication moves
-        // every fleet together; attaching directly to B here would veto A as a collision.
-        const transferring = handoff && allFamilies().some(family => family !== owner &&
-          family.primeConversationId === handoff.from && family.transfer?.from === handoff.from);
-        if (transferring) target = handoff!.from;
-        owner.owner = { kind: 'chatgpt_conversation', conversationId: target };
-        owner.primeConversationId = target;
-        owner.agents.get(PRIME_ID)!.info.conversationId = target;
-        for (const agent of owner.agents.values()) agent.info.primeConversationId = target;
-        // A handoff already in progress owns fleets discovered before its commit too.
-        const transfer = allFamilies().find(family => family !== owner && family.primeConversationId === target && family.transfer)?.transfer;
-        if (transfer) owner.transfer = { ...transfer };
-        else if (handoff?.from === target) owner.transfer = { from: target, at: handoff.openedAt, frozen: handoff.state === 'committing' };
-        attached = true;
-        changed();
+        await mutateSwarm(() => {
+          if (plannedRevision !== criticalMutationRevision) { requestOwnerRecoveryAgain = true; return; }
+          if (!allFamilies().includes(owner) || owner.primeConversationId || isWorkerConversation(target) ||
+            epoch !== requestOwnerEpoch || owner.primeRequestId !== requestId ||
+            requestCorrelation(requestId)?.conversationId !== proof.conversationId ||
+            requestCorrelation(requestId)?.sessionId !== proof.sessionId ||
+            [...parentBindings].some(([parent, binding]) => !allFamilies().includes(parent) || parent.primeConversationId !== binding)) return;
+          const handoff = continuationForSession(targetSessionId);
+          // The durable session can already name B while the same handoff still owns the
+          // broker's A -> B publication. Join its source projection so that publication moves
+          // every fleet together; attaching directly to B here would veto A as a collision.
+          const transferring = handoff && allFamilies().some(family => family !== owner &&
+            family.primeConversationId === handoff.from && family.transfer?.from === handoff.from);
+          if (transferring) target = handoff!.from;
+          owner.owner = { kind: 'chatgpt_conversation', conversationId: target };
+          owner.primeConversationId = target;
+          owner.agents.get(PRIME_ID)!.info.conversationId = target;
+          for (const agent of owner.agents.values()) agent.info.primeConversationId = target;
+          // A handoff already in progress owns fleets discovered before its commit too.
+          const transfer = allFamilies().find(family => family !== owner && family.primeConversationId === target && family.transfer)?.transfer;
+          if (transfer) owner.transfer = { ...transfer };
+          else if (handoff?.from === target) owner.transfer = { from: target, at: handoff.openedAt, frozen: handoff.state === 'committing' };
+          attached = true;
+          changed();
+        });
       }
       // A parent may have been attached after its provisional descendants were visited.
       if (attached) requestOwnerRecoveryAgain = true;
     } while (requestOwnerRecoveryAgain && epoch === requestOwnerEpoch);
+    // An earlier projection attempt can be map-idempotent after its exact write failed.
+    if (epoch === requestOwnerEpoch) await persistCriticalSwarmNow();
   })();
   requestOwnerRecovery = work;
   void work.finally(() => { if (requestOwnerRecovery === work) requestOwnerRecovery = null; }).catch(() => undefined);
@@ -5124,7 +5143,27 @@ function serializeAgents(agents: Map<string, Agent>, includeUnpublished: boolean
  * handover interrupted by a restart is abandoned, and the prime stays where it was.
  */
 export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
-  if (snapshot?.version === 8 && !Array.isArray(snapshot.agents)) throw new Error('Corrupt swarm authority envelope; startup must stop before admitting tools');
+  // Validate authority containers and identities before any lossy legacy normalization or
+  // clearing current state. A corrupt row cannot turn a known worker into an ordinary chat.
+  if (snapshot?.version === 8) {
+    if (!Array.isArray(snapshot.agents) || !Array.isArray(snapshot.activeRuns) || !Array.isArray(snapshot.dormantRuns))
+      throw new Error('Corrupt swarm authority envelope; startup must stop before admitting tools');
+    for (const family of [...snapshot.activeRuns, ...snapshot.dormantRuns]) {
+      if (!family || typeof family !== 'object') throw new Error('Corrupt worker family identity; startup must stop before admitting tools');
+      if (family.owner?.kind !== 'external_principal' && family.primeConversationId !== null) continue;
+      if (!Array.isArray(family.agents)) throw new Error('Corrupt external worker identity; startup must stop before admitting tools');
+      const ids = new Set<string>();
+      for (const row of family.agents) {
+        const info = row?.info;
+        const validId = info?.role === 'prime' ? info.id === PRIME_ID : info?.role === 'worker' &&
+          typeof info.id === 'string' && /^worker-[1-9][0-9]*$/.test(info.id) && info.id.length <= 80;
+        if (!validId || ids.has(info.id) || (info.conversationId !== null &&
+          (typeof info.conversationId !== 'string' || !info.conversationId || info.conversationId.length > 256)))
+          throw new Error('Corrupt external worker identity; startup must stop before admitting tools');
+        ids.add(info.id);
+      }
+    }
+  }
   requestOwnerEpoch++;
   requestOwnerRecovery = null;
   requestOwnerRecoveryAgain = false;

@@ -60,6 +60,8 @@ import {
   beginPrimeTransfer,
   cancelPrimeTransfer,
   commitPrimeTransfer,
+  mutateSwarm,
+  persistCriticalSwarmNow,
   freezePrimeTransfer,
   thawPrimeTransfer
 } from '../agents.js';
@@ -731,7 +733,9 @@ export async function repairPrimeFromResumeShadow(conversationId: string): Promi
   const repaired =
     currentTargetOwner === PRIME_ID
       ? false
-      : (recoveryHooks.repairPrimeTransfer?.(fromConversationId, conversationId) ?? false);
+      : await mutateSwarm(() => agentForOwnedConversation(conversationId) === PRIME_ID ? false : recoveryHooks.repairPrimeTransfer?.(fromConversationId, conversationId) ?? false);
+  // A previous derived-projection write may have failed after the map move.
+  await persistCriticalSwarmNow();
   if (repaired || workspaceChanged || goalChanged) {
     logWarn(
       `resume-shadow repair (${proof}) moved missing projections into chat ${conversationId}`
@@ -1223,38 +1227,42 @@ export async function claimContinuationNow(token: string, claimant: string): Pro
   });
 }
 
-function publishCommittedProjection(
+async function publishCommittedProjection(
   entry: Continuation,
   toConversationId: string,
   swarm: 'absent' | 'frozen' | 'recovery'
-): void {
+): Promise<void> {
   rebindConversation(entry.sessionId, entry.from, toConversationId);
   moveChatWorkspace(entry.from, toConversationId);
   moveGoalObjective(entry.from, toConversationId);
   moveGoalSwitch(entry.from, toConversationId);
   // A's final is superseded, never a completed turn in B. B earns its own debt.
   retireGoalDraftsFor(entry.from);
-  if (swarm === 'frozen' || swarm === 'absent') {
-    if (!commitPrimeTransfer(entry.from, toConversationId)) {
-      // The frozen handover cannot expire. A miss here means the run ended outright while
-      // the session write was in flight; there is no live prime left in A to split from.
-      if (swarm === 'frozen') logWarn(`continuation ${entry.token.slice(0, 8)} committed after its run ended; no prime to move`);
-    }
-  } else if (swarm === 'recovery') {
-    // Normal commitPrimeTransfer intentionally requires the ephemeral frozen transfer. After
-    // restart that lock is gone, so only a recovery hook explicitly authorised by the durable
-    // continuation WAL may repair the broker's derived A→B prime projection.
-    const repaired = recoveryHooks.repairPrimeTransfer?.(entry.from, toConversationId) ?? false;
-    if (!repaired && !commitPrimeTransfer(entry.from, toConversationId)) {
-      // Every app start replays the committed handoffs it still keeps. A chat that never led
-      // sub-agents has no fleet to move, and saying otherwise on each start was only noise.
-      if (!recoveryHooks.repairPrimeTransfer) {
-        logWarn(`continuation ${entry.token.slice(0, 8)} recovered without a broker prime repair hook`);
-      } else if (recoveryHooks.hasPrimeFleet?.(entry.from)) {
-        logWarn(`continuation ${entry.token.slice(0, 8)} recovered, but its sub-agent fleet is still led from ${entry.from}`);
+  await mutateSwarm(() => {
+    if (swarm === 'frozen' || swarm === 'absent') {
+      if (!commitPrimeTransfer(entry.from, toConversationId)) {
+        // The frozen handover cannot expire. A miss here means the run ended outright while
+        // the session write was in flight; there is no live prime left in A to split from.
+        if (swarm === 'frozen') logWarn(`continuation ${entry.token.slice(0, 8)} committed after its run ended; no prime to move`);
+      }
+    } else if (swarm === 'recovery') {
+      // Normal commitPrimeTransfer intentionally requires the ephemeral frozen transfer. After
+      // restart that lock is gone, so only a recovery hook explicitly authorised by the durable
+      // continuation WAL may repair the broker's derived A→B prime projection.
+      const repaired = recoveryHooks.repairPrimeTransfer?.(entry.from, toConversationId) ?? false;
+      if (!repaired && !commitPrimeTransfer(entry.from, toConversationId)) {
+        // Every app start replays the committed handoffs it still keeps. A chat that never led
+        // sub-agents has no fleet to move, and saying otherwise on each start was only noise.
+        if (!recoveryHooks.repairPrimeTransfer) {
+          logWarn(`continuation ${entry.token.slice(0, 8)} recovered without a broker prime repair hook`);
+        } else if (recoveryHooks.hasPrimeFleet?.(entry.from)) {
+          logWarn(`continuation ${entry.token.slice(0, 8)} recovered, but its sub-agent fleet is still led from ${entry.from}`);
+        }
       }
     }
-  }
+  });
+  // Repair retries can be map-idempotent while their prior write is still outstanding.
+  await persistCriticalSwarmNow();
 }
 
 async function rollbackCommitting(
@@ -1317,7 +1325,11 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
         };
       }
     }
-    publishCommittedProjection(entry, toConversationId, 'recovery');
+    try {
+      await publishCommittedProjection(entry, toConversationId, 'recovery');
+    } catch (error) {
+      return { status: 'retryable', reason: `the session already moved; broker projection persistence must retry: ${error instanceof Error ? error.message : String(error)}` };
+    }
     await finishCommittedRecord(entry, toConversationId);
     return { status: 'already-committed', conversationId: toConversationId };
   }
@@ -1383,7 +1395,11 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
           };
         }
       }
-      publishCommittedProjection(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent');
+      try {
+        await publishCommittedProjection(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent');
+      } catch (error) {
+        return { status: 'retryable', reason: `the session already moved; broker projection persistence must retry: ${error instanceof Error ? error.message : String(error)}` };
+      }
       await finishCommittedRecord(entry, toConversationId);
       return { status: 'committed', conversationId: toConversationId };
     }
@@ -1405,7 +1421,11 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
   }
 
   // --- publish. Total map work only, after the authoritative durable attachment says B.
-  publishCommittedProjection(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent');
+  try {
+    await publishCommittedProjection(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent');
+  } catch (error) {
+    return { status: 'retryable', reason: `the session already moved; broker projection persistence must retry: ${error instanceof Error ? error.message : String(error)}` };
+  }
   await finishCommittedRecord(entry, toConversationId);
   logInfo(
     `continuation ${entry.token.slice(0, 8)} committed: session ${entry.sessionId} is now chat ${toConversationId}`
@@ -1710,7 +1730,7 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
             );
           }
         }
-        publishCommittedProjection(entry, entry.to, 'recovery');
+        await publishCommittedProjection(entry, entry.to, 'recovery');
         entry.state = 'committed';
         entry.error = null;
         logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);

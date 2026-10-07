@@ -415,3 +415,59 @@ it('refuses a v8 family container whose worker identities cannot be recovered', 
   saved.activeRuns![0] = null as never;
   expect(() => broker.restoreSwarm(saved)).toThrow('Corrupt worker family identity');
 });
+
+
+it.each(['activeRuns', 'dormantRuns'] as const)('refuses missing or malformed v8 %s before clearing existing authority', (key) => {
+  const stage = broker.stageSpawn({ caller: a, workers: [{ task: 'known authority' }] }); stage.commit();
+  broker.bindConversation('worker-1', 'known-authority-worker', stage.runId);
+  const original = broker.snapshotSwarm()!;
+  for (const value of [undefined, null, {}, 'lost']) {
+    const damaged = structuredClone(original); (damaged as any)[key] = value;
+    const unchanged = structuredClone(damaged);
+    expect(() => broker.restoreSwarm(damaged)).toThrow('Corrupt swarm authority envelope');
+    expect(damaged).toEqual(unchanged);
+    expect(broker.isWorkerConversation('known-authority-worker')).toBe(true);
+  }
+});
+
+it.each(['missing id', 'duplicate id', 'bad role', 'bad conversation'] as const)('refuses lossy external worker restoration: %s', (damage) => {
+  const stage = broker.stageSpawn({ caller: a, workers: [{ task: 'known authority' }] }); stage.commit();
+  broker.bindConversation('worker-1', 'known-authority-worker', stage.runId);
+  const saved = broker.snapshotSwarm()!;
+  const rows = saved.activeRuns![0]!.agents;
+  const worker = rows.find(row => row.info.role === 'worker')!;
+  if (damage === 'missing id') delete (worker.info as any).id;
+  if (damage === 'duplicate id') rows.push(structuredClone(worker));
+  if (damage === 'bad role') (worker.info as any).role = 'other';
+  if (damage === 'bad conversation') (worker.info as any).conversationId = {};
+  const original = structuredClone(saved);
+  expect(() => broker.restoreSwarm(saved)).toThrow('Corrupt external worker identity');
+  expect(saved).toEqual(original);
+  expect(broker.isWorkerConversation('known-authority-worker')).toBe(true);
+});
+
+
+it.each([{ clear: false, external: true }, { clear: true, external: true }, { clear: false, external: false }, { clear: true, external: false }])('orders late custody after an in-flight snapshot and rechecks queued authority: %j', async ({ clear, external }) => {
+  const root = broker.stageSpawn({ caller: external ? a : { conversationId: 'custody-prime' }, workers: [{ task: 'root' }] }); root.commit();
+  broker.bindConversation('worker-1', 'custody-worker', root.runId);
+  const summary = await createSession({ conversationId: 'custody-worker' });
+  const provisional = broker.stageSpawn({ caller: { requestId: 'custody-request' }, workers: [{ task: 'provisional' }] }); provisional.commit();
+  const store = await import('../src/main/session/store.js');
+  const session = await store.getSession(summary.id);
+  vi.spyOn(store, 'getSession').mockResolvedValue(session);
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const writes: Array<broker.SwarmSnapshot | null> = [];
+  broker.onSwarmPersistNow(async snapshot => { writes.push(structuredClone(snapshot)); if (writes.length === 1) { enter(); await held; } });
+  const barrier = broker.persistCriticalSwarmNow(); await entered;
+  const cleared = clear ? broker.mutateSwarm(() => broker.resetSwarm()) : Promise.resolve();
+  observeRequestCorrelation({ requestId: 'custody-request', conversationId: 'custody-worker', sessionId: summary.id, messageId: 'proof', tool: 'agents', observedAt: Date.now() });
+  const reconcile = broker.reconcileAgentRequestOwners();
+  await Promise.resolve(); await Promise.resolve();
+  const during = broker.snapshotSwarm()!.activeRuns!.find(row => row.runId === provisional.runId)!.owner;
+  release(); await barrier; await cleared; await reconcile;
+  expect(during).toEqual({ kind: 'chatgpt_request', requestId: 'custody-request' });
+  if (clear) expect(writes.at(-1)?.activeRuns ?? []).toHaveLength(0);
+  else expect(writes.at(-1)!.activeRuns!.find(row => row.runId === provisional.runId)!.owner).toEqual(external ? { kind: 'external_principal', principalId: a.principalId } : { kind: 'chatgpt_conversation', conversationId: 'custody-prime' });
+});

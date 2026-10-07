@@ -33,6 +33,7 @@ const {
   finishAgent,
   freezePrimeTransfer,
   noteAgentContextTokens,
+  onSwarmPersistNow,
   pendingWorkerRevivals,
   primeConversation,
   primeConversationGone,
@@ -131,6 +132,7 @@ afterAll(async () => {
 beforeEach(async () => {
   resetContinuationsForTests();
   resetAgentsForTests();
+  onSwarmPersistNow(async () => undefined);
   resetRecorderForTests();
   resetWorkspaces();
   resetGoalStateForTests();
@@ -920,6 +922,7 @@ describe('the swarm handover', () => {
     expect(await store.rebindSession(summary.id, CHAT_A, CHAT_B)).toBe(true);
     expect((await getSession(summary.id))?.lastCommittedResumeHandoffId).toBeNull();
     resetAgentsForTests();
+  onSwarmPersistNow(async () => undefined);
     restoreSwarm(swarmSnapshot);
     resetGoalStateForTests();
     // This suite deliberately uses short synthetic chat ids (`chat-a`/`chat-b`) that the Goal
@@ -1081,6 +1084,7 @@ describe('the swarm handover', () => {
     expect(swarmRunning()).toBe(true);
 
     resetAgentsForTests();
+  onSwarmPersistNow(async () => undefined);
     startSwarm(CHAT_A);
     beginPrimeTransfer(CHAT_A);
     expect(primeConversationGone(CHAT_A)).toBe(false);
@@ -1100,6 +1104,7 @@ describe('the swarm handover', () => {
     expect(primeConversation()).toBe(CHAT_B);
 
     resetAgentsForTests();
+  onSwarmPersistNow(async () => undefined);
     startSwarm(CHAT_A);
     beginPrimeTransfer(CHAT_A);
     expect(freezePrimeTransfer(CHAT_A)).toBe('frozen');
@@ -1960,4 +1965,48 @@ describe('an exact handoff response owns its waiting deadline', () => {
       expect(continuationByToken(opened.token)?.state).toBe('aborted');
     } finally { vi.useRealTimers(); }
   });
+});
+
+
+it('queues broker prime publication behind a pending exact snapshot after the session commit', async () => {
+  const broker = await import('../src/main/agents.js');
+  broker.onSwarmPersistNow(async () => undefined);
+  spawn({ caller: { conversationId: CHAT_A }, workers: [{ task: 'handover race' }] });
+  const { token } = await readyContinuation();
+  await claimContinuationNow(token, 'tab-1');
+  let enter!: () => void, release!: () => void, rebound!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const sessionMoved = new Promise<void>(resolve => { rebound = resolve; });
+  const writes: Array<ReturnType<typeof snapshotSwarm>> = [];
+  broker.onSwarmPersistNow(async snapshot => { writes.push(structuredClone(snapshot)); if (writes.length === 1) { enter(); await held; } });
+  const barrier = broker.persistCriticalSwarmNow(); await entered;
+  const original = store.rebindSession;
+  vi.spyOn(store, 'rebindSession').mockImplementation(async (...args) => { const moved = await original(...args); rebound(); return moved; });
+  const commit = commitContinuation(token, CHAT_B);
+  await sessionMoved; await Promise.resolve();
+  const during = primeConversation();
+  release(); await barrier;
+  expect(await commit).toBe(true);
+  expect(during).toBe(CHAT_A);
+  expect(writes.at(-1)!.activeRuns![0]!.primeConversationId).toBe(CHAT_B);
+});
+
+
+it('retains session B and a retryable WAL when its broker projection write fails', async () => {
+  spawn({ caller: { conversationId: CHAT_A }, workers: [{ task: 'durable move' }] });
+  const { sessionId, token } = await readyContinuation();
+  await claimContinuationNow(token, 'tab-1');
+  setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+  onSwarmPersistNow(async () => { throw new Error('broker disk failure'); });
+  const { commitContinuationResult } = await import('../src/main/session/continuation.js');
+  const result = await commitContinuationResult(token, CHAT_B);
+  expect(result).toMatchObject({ status: 'retryable', reason: expect.stringContaining('session already moved') });
+  expect(await attachedChat(sessionId)).toBe(CHAT_B);
+  expect(continuationByToken(token)?.state).toBe('committing');
+  const writes: Array<ReturnType<typeof snapshotSwarm>> = [];
+  onSwarmPersistNow(async snapshot => { writes.push(structuredClone(snapshot)); });
+  expect(await commitContinuation(token, CHAT_B)).toBe(true);
+  expect(writes.at(-1)!.activeRuns![0]!.primeConversationId).toBe(CHAT_B);
+  expect(continuationByToken(token)?.state).toBe('committed');
 });

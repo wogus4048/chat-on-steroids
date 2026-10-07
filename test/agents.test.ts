@@ -3775,8 +3775,8 @@ describe('through the MCP endpoint', () => {
     const snapshots: Array<ReturnType<typeof snapshotSwarm>> = [];
     onSwarmPersist(() => snapshots.push(snapshotSwarm()));
     let fail = true;
-    onSwarmPersistNow(async () => {
-      if (fail) {
+    onSwarmPersistNow(async (_snapshot, options) => {
+      if (fail && options?.retry === false) {
         fail = false;
         throw new Error('injected disk barrier failure');
       }
@@ -3796,9 +3796,8 @@ describe('through the MCP endpoint', () => {
     // rollback is itself a critical mutation and therefore emits a newer safe snapshot. This
     // supersedes durable.ts's retained failed generation instead of letting it resurrect the
     // rejected message later.
-    // The injected failure can now be consumed by the earlier context/revival measurement
-    // barrier, before message staging exists at all. In that case no rollback snapshot is
-    // necessary. If any debounced snapshots were published, none may contain the rejected row.
+    // Inject into the speculative stage write (retry:false), not an earlier ingress drain.
+    // Any ordinary snapshot published after rollback must exclude the rejected row.
     expect(
       snapshots.every(
         (snapshot) => snapshot?.agents.find((entry) => entry.info.id === 'worker-1')?.queue.length !== 1
@@ -3815,8 +3814,8 @@ describe('through the MCP endpoint', () => {
     startSwarm(1);
     expect(bindConversation('worker-1', 'c-worker-1')).toBe(true);
     let fail = true;
-    onSwarmPersistNow(async () => {
-      if (fail) {
+    onSwarmPersistNow(async (_snapshot, options) => {
+      if (fail && options?.retry === false) {
         fail = false;
         throw new Error('injected finish durability failure');
       }
@@ -4191,7 +4190,7 @@ describe('through the MCP endpoint', () => {
     const peer = { conversationId: 'mcp-peer-durability' };
     spawn({ caller: prime, workers: [{ task: 'A worker' }] });
     const b = spawn({ caller: peer, workers: [{ task: 'B worker' }] });
-    onSwarmPersistNow(async () => { throw new Error('injected peer write failure'); });
+    onSwarmPersistNow(async (_snapshot, options) => { if (options?.retry === false) throw new Error('injected peer write failure'); });
 
     const failed = await asChat(PRIME_CHAT, 'message', { target_run_id: b.runId, text: 'audit parser' });
     expect(failed).toContain('Nothing was queued; retry the same message request. (injected peer write failure)');
@@ -4208,7 +4207,7 @@ describe('through the MCP endpoint', () => {
   it('fails closed if a persistence callback bypasses the acceptance lane and destroys its destination', async () => {
     spawn({ caller: prime, workers: [{ task: 'A worker' }] });
     const b = spawn({ caller: { conversationId: 'mcp-peer-retired' }, workers: [{ task: 'B worker' }] });
-    onSwarmPersistNow(async () => { clearAgent(PRIME_ID, b.runId); });
+    onSwarmPersistNow(async (_snapshot, options) => { if (options?.retry === false) clearAgent(PRIME_ID, b.runId); });
 
     const failed = await asChat(PRIME_CHAT, 'message', { target_run_id: b.runId, text: 'late handoff' });
     expect(failed).toContain('Broker acceptance invariant failed; restart to restore the durable snapshot');

@@ -150,6 +150,7 @@ const {
   pendingWorkerSpawns,
   releaseQuiescentRun,
   onSwarmPersistNow,
+  mutateSwarm,
   onRetiredWorkersPersistNow,
   persistCriticalSwarmNow,
   retiredWorkerForConversation,
@@ -6439,6 +6440,51 @@ describe('delivering a bootstrap', () => {
     // execution claim parks immediately while the failed worker remains in the prime's history.
     expect(pendingWorkerSpawns()).toEqual([]);
     expect(swarmState().running).toBe(false);
+  });
+
+  it.each(['bootstrap', 'revival'] as const)('does not apply a dropped %s to a later worker assignment', async (kind) => {
+    await pair();
+    spawn({ workers: [{ task: 'drop race' }], caller: { conversationId: PRIME_CHAT } });
+    const runId = currentRunId()!;
+    const conversationId = 'bcbcbcbc-7654-4210-8edc-ba9876543210';
+    if (kind === 'revival') {
+      const bootstrap = await redeem();
+      await request('POST', '/commands/ack', { body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' } });
+      finishAgent({ conversationId }, 'first task done');
+      wake([{ to: 'worker-1', text: 'old wake' }]);
+      await waitForRevival();
+    }
+    const gate = faultGate(); let first = true;
+    onSwarmPersistNow(async (snapshot, options) => { if (first) { first = false; await gate.hold(); } await writeDurableNow('swarm', snapshot, options); });
+    const barrier = persistCriticalSwarmNow(); await gate.entered;
+    // This proof/new assignment is already queued ahead of the old command retirement.
+    const newer = mutateSwarm(() => {
+      if (kind === 'bootstrap') bindConversation('worker-1', conversationId, runId);
+      else {
+        noteAgentAlive(conversationId, 'call');
+        finishAgent({ conversationId }, 'old wake finished');
+        wake([{ to: 'worker-1', text: 'new wake must survive' }]);
+      }
+    });
+    for (let n = 0; n < 20; n++) queueResume(`stale-drop-${n}`, `stale-drop-token-${n}`);
+    gate.release(); await barrier; await newer; await persistCriticalSwarmNow();
+    const worker = swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find(row => row.id === 'worker-1')!;
+    expect(worker.state).toBe(kind === 'bootstrap' ? 'active' : 'waking');
+    if (kind === 'revival') expect(pendingWorkerRevivals()[0]!.text).toContain('new wake must survive');
+  });
+
+  it('retains dropped command recovery custody when the broker write rejects', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'retained failure custody' }], caller: { conversationId: PRIME_CHAT } });
+    const command = pendingCommands().find(row => row.what === `worker:${currentRunId()}:worker-1`)!;
+    await flushDurable();
+    onSwarmPersistNow(async () => { throw new Error('drop disk failure'); });
+    for (let n = 0; n < 20; n++) queueResume(`failed-drop-${n}`, `failed-drop-token-${n}`);
+    await expect(persistCriticalSwarmNow()).rejects.toThrow('drop disk failure');
+    await flushDurable();
+    expect(pendingCommands().some(row => row.id === command.id)).toBe(false);
+    const durable = await readDurable<any>('bridge-commands');
+    expect(durable.commands.some((row: { id: string }) => row.id === command.id)).toBe(true);
   });
 
   it('opens a worker chat with the requested model in its URL', async () => {

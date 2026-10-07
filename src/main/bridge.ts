@@ -9970,6 +9970,7 @@ function drop(command: Command, why: string): boolean {
     return true;
   }
   const needsBrokerFence = command.spec.type === 'worker' || command.spec.type === 'revive';
+  const retiredSpec = { ...command.spec };
   if (needsBrokerFence) commandRetirementsAwaitingBroker.set(command.id, command);
   // A resume whose replacement chat never opened has to end its transaction too, or the
   // session sits "opening" forever with nothing coming. Aborting leaves the session
@@ -10005,13 +10006,29 @@ function drop(command: Command, why: string): boolean {
   // and makes this a no-op.
   if (needsBrokerFence) {
     void mutateSwarm(() => {
-      if (command.spec.type === 'worker') failAgent(command.spec.agent, why, undefined, {}, command.spec.runId);
-      if (command.spec.type === 'revive') failWorkerRevival(command.spec.agent, why, command.spec.runId);
+      // The transport can retire while an earlier queued proof/new assignment owns the
+      // broker lane. Reuse the broker's exact outstanding bootstrap/wake, never a friendly
+      // worker name or merely its current waking state. Spec is copied before queueing.
+      if (retiredSpec.type === 'worker' && pendingWorkerSpawns().some(worker =>
+          worker.runId === retiredSpec.runId && worker.id === retiredSpec.agent)) {
+        failAgent(retiredSpec.agent, why, undefined, {}, retiredSpec.runId);
+      }
+      if (retiredSpec.type === 'revive') {
+        const owed = revivalFor(retiredSpec.agent, retiredSpec.runId);
+        const current = agentInfoForOwnedConversation(retiredSpec.conversationId);
+        const sameAssignment = current?.runId === retiredSpec.runId && current.id === retiredSpec.agent &&
+          (current.lastRevivalCommandId === command.id || (retiredSpec.wake.length > 0 &&
+            owed?.messageIds.join(' ') === retiredSpec.wake));
+        if (owed?.conversationId === retiredSpec.conversationId && sameAssignment)
+          failWorkerRevival(retiredSpec.agent, why, retiredSpec.runId);
+      }
       releaseQuiescentRun();
       return true;
     })
-      .then((durable) => {
-        if (!durable) {
+      .then(async () => {
+        // A stale no-op may follow a failed liveness write. Its current projection still
+        // needs durability before the old command's recovery custody can be released.
+        if (!(await persistCriticalSwarmNow())) {
           logWarn(
             `bridge: kept retired ${specKey(command.spec)} durable because its broker transition had no immediate persistence sink`
           );
