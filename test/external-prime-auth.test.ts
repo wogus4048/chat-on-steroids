@@ -159,3 +159,13 @@ describe('result response byte contract', () => {
     expect(externalResponseSchemas.workers_result.safeParse({ ok: true, data: { ...small, eof: false } }).success).toBe(false);
   });
 });
+
+describe('status selection contract', () => {
+  it('accepts no selector or one selector and rejects both selectors', () => {
+    const schema = externalToolSchemas.workers_status;
+    expect(schema.safeParse({}).success).toBe(true);
+    expect(schema.safeParse({ family_id: id }).success).toBe(true);
+    expect(schema.safeParse({ request_id: id }).success).toBe(true);
+    expect(schema.safeParse({ family_id: id, request_id: id }).success).toBe(false);
+  });
+});

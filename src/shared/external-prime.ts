@@ -32,7 +32,8 @@ const uuid = z.string().uuid();
 const revision = z.number().int().min(1);
 const familySelector = z.union([z.object({ new: z.literal(true) }).strict(), z.object({ id: familyIdSchema }).strict()]);
 export const externalToolSchemas = {
-  workers_status: z.object({ family_id: familyIdSchema.optional(), request_id: requestIdSchema.optional() }).strict(),
+  workers_status: z.object({ family_id: familyIdSchema.optional(), request_id: requestIdSchema.optional() }).strict()
+    .refine(value => value.family_id === undefined || value.request_id === undefined, 'Select either family_id or request_id'),
   workers_spawn: z.object({ request_id: requestIdSchema, family: familySelector, task: text, context: z.string().max(EXTERNAL_PRIME_LIMITS.taskChars).optional(), model: z.string().trim().min(1).max(80).optional(), workspace_root_id: workspaceRootIdSchema }).strict(),
   workers_message: z.object({ request_id: requestIdSchema, family_id: familyIdSchema, worker_id: workerId, message: text, resume: z.boolean().default(false) }).strict(),
   workers_reports: z.object({ family_id: familyIdSchema, cursor: cursor.optional(), limit: z.number().int().min(1).max(20).default(10) }).strict(),
