@@ -1,3 +1,4 @@
+import { DEFAULT_EXTERNAL_PRIME, externalPrimeSettingsSchema } from '../shared/external-prime.js';
 import { UI_LANGUAGES } from '../shared/ui-language.js';
 import { REASONING_EFFORTS } from '../shared/session.js';
 import { appearanceSchema } from './appearance-schema.js';
@@ -515,6 +516,7 @@ const configSchema = z.object({
     .optional()
     .default({ ...DEFAULT_MCP })
     .catch({ ...DEFAULT_MCP }),
+  externalPrime: externalPrimeSettingsSchema.optional().default(() => ({ enabled: false, principals: [] })),
   // A malformed value falls back to off rather than to conservative recovery: the switches can
   // only ever widen access, so "off" is the safe repair and the rest of the file stays valid.
   // Each field repairs on its own, so a bad `allowActions` cannot switch the API itself off, and
@@ -559,6 +561,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
     goal: { ...DEFAULT_GOAL },
     mcp: { ...DEFAULT_MCP },
+    externalPrime: { ...DEFAULT_EXTERNAL_PRIME, principals: [] },
     controlApi: { ...DEFAULT_CONTROL_API }
   };
 }
@@ -641,7 +644,14 @@ export async function loadConfig(): Promise<Config> {
   try {
     raw = await fs.readFile(configPath, 'utf8');
     // Windows PowerShell 5.1 and older Notepad start UTF-8 files with a byte-order mark; it is not JSON.
-    const parsed = configSchema.safeParse(JSON.parse(raw.replace(/^\uFEFF/, '')));
+    const stored: unknown = JSON.parse(raw.replace(/^\uFEFF/, ''));
+    if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+      const value = stored as Record<string, unknown>;
+      if (value.externalPrime !== undefined && !externalPrimeSettingsSchema.safeParse(value.externalPrime).success) {
+        value.externalPrime = { enabled: false, principals: [] };
+      }
+    }
+    const parsed = configSchema.safeParse(stored);
     if (!parsed.success) {
       logError('Settings file was invalid and has been reset to defaults');
       await keepUnreadable(raw);

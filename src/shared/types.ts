@@ -1,3 +1,4 @@
+import type { ExternalPrimeSettings } from './external-prime.js';
 import type { ReasoningEffort } from './session.js';
 import { WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from './windows-computer.js';
 import { BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from './browser-control.js';
@@ -393,6 +394,7 @@ export interface Config {
   goal: GoalSettings;
   mcp: McpSettings;
   controlApi: ControlApiSettings;
+  externalPrime: ExternalPrimeSettings;
 }
 
 export type ConnectionState =

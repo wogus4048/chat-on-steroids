@@ -1004,3 +1004,18 @@ describe('a settings file the app cannot read as is', () => {
     expect(await fs.readFile(path.join(dir, saved[0]!), 'utf8')).toBe(content);
   });
 });
+
+describe('external prime config migration', () => {
+  it('is off for fresh and legacy config and preserves saved settings', async () => {
+    expect(defaultConfig().externalPrime).toEqual({ enabled: false, principals: [] });
+    const legacy = defaultConfig() as Partial<Config>; delete legacy.externalPrime;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy));
+    expect((await loadConfig()).externalPrime).toEqual({ enabled: false, principals: [] });
+    await saveConfig({ ...defaultConfig(), externalPrime: { enabled: true, principals: [] } });
+    expect((await loadConfig()).externalPrime.enabled).toBe(true);
+  });
+  it('malformed external config closes ingress without resetting unrelated policy', async () => {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), readOnly: true, externalPrime: { enabled: true, principals: [{ token: 'raw-secret' }] } }));
+    const loaded = await loadConfig(); expect(loaded.externalPrime).toEqual({ enabled: false, principals: [] }); expect(loaded.readOnly).toBe(true);
+  });
+});
