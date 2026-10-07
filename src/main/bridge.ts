@@ -1,3 +1,6 @@
+import { currentSessionTurnBinding } from './session/store.js';
+import { externalStopBindingSchema, type ExternalStopBinding } from '../shared/external-prime.js';
+import { externalStopBindingCurrent, workerPrimeOwner, recordExternalStopEvidence, externalWorkerCommandAdmission } from './agents.js';
 import { externalPlacementGrant } from './session/conversation-access.js';
 import { ExternalPrimeError } from './external-prime-auth.js';
 import { externalPlacementToolContext } from './mcp/kernel.js';
@@ -371,6 +374,7 @@ const BROWSER_PRESENT_MS = 60_000;
 type CommandSpec =
   | {
       type: 'worker';
+      externalAdmissionRevision?: number;
       agent: string;
       task: string;
       /**
@@ -400,6 +404,7 @@ type CommandSpec =
    */
   | {
       type: 'revive';
+      externalAdmissionRevision?: number;
       agent: string;
       conversationId: string;
       runId: string;
@@ -426,7 +431,7 @@ type CommandSpec =
    * brief got newer — not two fresh chats, which is what keying on the handoff produced.
    */
   | { type: 'resume'; sessionId: string; token: string }
-  | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string };
+  | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string; expectedBinding?: ExternalStopBinding };
 
 interface Command {
   id: string;
@@ -497,6 +502,7 @@ type CommandPhase = 'queued' | 'leased';
 type CommandReceiptOutcome = 'committed' | 'terminal-failure';
 
 interface CommandReceipt {
+  externalStop?: ExternalStopBinding;
   id: string;
   client: string | null;
   conversationId: string | null;
@@ -663,7 +669,10 @@ function companionHost(req: http.IncomingMessage): 'extension' | 'cos' | null {
 
 /** Null is ordinary GPT placement; false is external placement without current authority. */
 function commandExternalPlacement(spec: CommandSpec) {
+  if (spec.type === 'stop' && spec.expectedBinding) return externalStopTurnCurrent(spec) ? externalWorkerPlacement(spec.expectedBinding.familyId) : false;
   if (spec.type !== 'worker' && spec.type !== 'revive') return null;
+  const admission = externalWorkerCommandAdmission(spec.runId, spec.agent);
+  if (admission ? admission.stopped || admission.revision !== (spec.externalAdmissionRevision ?? 0) : spec.externalAdmissionRevision !== undefined) return false;
   const origin = workerFamilyOrigin(spec.runId);
   if (origin?.owner.kind !== 'external_principal') return null;
   const placement = externalWorkerPlacement(origin.familyId);
@@ -1904,12 +1913,23 @@ async function stopUserAnchor(sessionId: string, turnId: string): Promise<string
   return undefined;
 }
 /** Stop is a request against one exact live turn, never a predicted final boundary. */
-export async function stopSessionTurn(sessionId: string, expectedTurnId: string): Promise<SessionControlsView> {
+export async function stopSessionTurn(sessionId: string, expectedTurnId: string, expectedBinding?: ExternalStopBinding): Promise<SessionControlsView> {
+  const assertBinding = () => {
+    const sessionBinding = expectedBinding ? currentSessionTurnBinding(sessionId) : null;
+    if (expectedBinding && (!externalStopCurrent(expectedBinding) || workerPrimeOwner(expectedBinding.conversationId).stopIntent?.turnId !== expectedTurnId || sessionBinding?.conversationId !== expectedBinding.conversationId || sessionBinding.activeTurnId !== expectedTurnId)) throw new Error('external_stop_binding_changed');
+  };
+  assertBinding();
   const id = await controlledConversation(sessionId);
+  assertBinding();
+  if (expectedBinding && id !== expectedBinding.conversationId) throw new Error('external_stop_binding_changed');
   const assertCurrent = async () => {
-    const latest = await getSession(sessionId);
-    if (latest?.conversationId !== id || latest.activeTurnId !== expectedTurnId || !expectedTurnId ||
-        await conversationWasSuperseded(id) || (await sessionControlsFor(sessionId)).activeTurnId !== expectedTurnId) throw new Error('active_turn_changed');
+    assertBinding();
+    const latest = await getSession(sessionId); assertBinding();
+    if (latest?.conversationId !== id || latest.activeTurnId !== expectedTurnId || !expectedTurnId) throw new Error('active_turn_changed');
+    const superseded = await conversationWasSuperseded(id); assertBinding();
+    if (superseded) throw new Error('active_turn_changed');
+    const controls = await sessionControlsFor(sessionId); assertBinding();
+    if (controls.activeTurnId !== expectedTurnId) throw new Error('active_turn_changed');
   };
   await assertCurrent();
   await setSessionAutomation(sessionId, 'off');
@@ -1918,25 +1938,27 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
   const userMessageId = await stopUserAnchor(sessionId, expectedTurnId);
   await assertCurrent();
   const alreadyQueued = commands.some(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId && entry.spec.turnId === expectedTurnId);
-  const command = queue({ type: 'stop', sessionId, conversationId: id, turnId: expectedTurnId, ...(userMessageId ? { userMessageId } : {}) });
+  assertBinding();
+  const command = queue({ type: 'stop', sessionId, conversationId: id, turnId: expectedTurnId, ...(userMessageId ? { userMessageId } : {}), ...(expectedBinding ? { expectedBinding } : {}) });
   try {
     // Reuse the command lease barrier: status must not hand out an unsaved request.
     const pendingLease = commandWrites.get(command.id);
-    if (pendingLease && !await pendingLease) throw new Error('stop_request_not_durable');
-    if (!commands.includes(command) || (command.claimedAt === null && !await persistCommandLease(command, null, Date.now())))
-      throw new Error('stop_request_not_durable');
+    if (pendingLease) { const saved = await pendingLease; assertBinding(); if (!saved) throw new Error('stop_request_not_durable'); }
+    if (!commands.includes(command)) throw new Error('stop_request_not_durable');
+    if (command.claimedAt === null) { const saved = await persistCommandLease(command, null, Date.now()); assertBinding(); if (!saved) throw new Error('stop_request_not_durable'); }
     await assertCurrent();
     await releaseSessionFinish(sessionId, expectedTurnId, 'stop');
     await assertCurrent();
   } catch (error) { retire(command, 'stop request could not be saved or its turn changed'); throw error; }
   armDeadline(command);
   await revokeSilenceInputs(sessionId);
+  assertBinding();
   endActivity(id);
   repairsInFlight.delete(id);
   if (!alreadyQueued) logInfo(`bridge: desktop Stop requested for session ${sessionId}, conversation ${id}, turn ${expectedTurnId}, command ${command.id}; native cancellation is unconfirmed`);
   wakeBrowserWork();
   changed();
-  if (!alreadyQueued) {
+  if (!alreadyQueued && !expectedBinding) {
     const lifecycle = bridgeLifecycleEpoch;
     // The shared startup owner launches only on positive process absence. An
     // existing browser remains the extension election's responsibility.
@@ -1946,21 +1968,36 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
         liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
     });
   }
-  return sessionControlsFor(sessionId);
+  const finalControls = await sessionControlsFor(sessionId); assertBinding();
+  return finalControls;
+}
+function externalStopTurnCurrent(spec: Extract<CommandSpec, { type: 'stop' }>): boolean {
+  if (!spec.expectedBinding) return true;
+  const session = currentSessionTurnBinding(spec.sessionId);
+  return session?.conversationId === spec.conversationId && session.activeTurnId === spec.turnId && externalStopCurrent(spec.expectedBinding) && workerPrimeOwner(spec.conversationId).stopIntent?.turnId === spec.turnId;
+}
+function externalStopCurrent(binding: ExternalStopBinding): boolean {
+  if (!externalStopBindingCurrent(binding)) return false;
+  const owner = workerPrimeOwner(binding.conversationId);
+  try { return externalPlacementGrant(binding.principalId, owner.externalPlacement, owner.setupProfileId).policyRevision === binding.policyRevision; } catch { return false; }
 }
 async function stopCommandCurrent(spec: Extract<CommandSpec, { type: 'stop' }>): Promise<boolean> {
+  if (!externalStopTurnCurrent(spec)) return false;
   const session = await getSession(spec.sessionId);
-  return Boolean(session?.conversationId === spec.conversationId && session.activeTurnId === spec.turnId &&
-    !await conversationWasSuperseded(spec.conversationId));
+  if (!externalStopTurnCurrent(spec)) return false;
+  if (session?.conversationId !== spec.conversationId || session.activeTurnId !== spec.turnId) return false;
+  const superseded = await conversationWasSuperseded(spec.conversationId);
+  return !superseded && externalStopTurnCurrent(spec);
 }
 function stopRequestedFor(conversationId: string, turnId = liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId): boolean {
   return commands.some(command => command.spec.type === 'stop' && command.spec.conversationId === conversationId &&
+    (!command.spec.expectedBinding || externalStopCurrent(command.spec.expectedBinding)) &&
     (!turnId || command.spec.turnId === turnId) && Date.now() - command.createdAt < STOP_COMMAND_TIMEOUT_MS);
 }
-async function pendingStopCommands(): Promise<Array<{ id: string; conversationId: string; turnId: string; expiresAt: number }>> {
+async function pendingStopCommands(browser: string | null, host: 'extension' | 'cos' | null): Promise<Array<{ id: string; conversationId: string; turnId: string; expiresAt: number }>> {
   const pending = [];
   for (const command of [...commands]) {
-    if (command.spec.type !== 'stop' || commandWrites.has(command.id)) continue;
+    if (command.spec.type !== 'stop' || commandWrites.has(command.id) || !commandMatchesCompanion(command.spec, browser, host)) continue;
     if (Date.now() - command.createdAt >= STOP_COMMAND_TIMEOUT_MS || !await stopCommandCurrent(command.spec)) {
       retire(command, 'the requested turn is no longer stoppable'); continue;
     }
@@ -2464,7 +2501,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       {
         ok: true,
         conversations: live,
-        stopTurns: await pendingStopCommands(),
+        stopTurns: await pendingStopCommands(browserOf(req), companionHost(req)),
         modelCatalogRequest: pendingChatModelRequest(),
         // This install's connector names, so the extension recognizes exactly its own traffic.
         connectorNames: connectorNames(getConfig().connectorSuffix),
@@ -3101,7 +3138,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       (sleptWorker.state === 'sleeping' || sleptWorker.state === 'waking') &&
       sleptWorker.sleptAt !== null && live.activeTurnStartedAt !== null && live.activeTurnStartedAt <= sleptWorker.sleptAt;
     const pendingStop = !superseded && summary?.conversationId === id && summary.activeTurnId === live.activeTurnId && stopRequestedFor(id, live.activeTurnId)
-      ? commands.find(command => command.spec.type === 'stop' && command.spec.sessionId === live!.sessionId && command.spec.turnId === live!.activeTurnId) : undefined;
+      ? commands.find(command => command.spec.type === 'stop' && command.spec.sessionId === live!.sessionId && command.spec.turnId === live!.activeTurnId && commandMatchesCompanion(command.spec, browserOf(req), companionHost(req))) : undefined;
     if (!automaticCompactionAllowed(summary)) await cancelAutomaticResumesNow(live.sessionId);
     // Worker chats and user-blocked chats alike: neither may auto-compact — see goalBlockReason.
     const workerBlocked = goalFencedChat(id);
@@ -4298,6 +4335,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return json(res, 409, { error: 'stop_turn_changed' }, origin);
       if (!await persistCommandLease(command, client, Date.now(), false)) return json(res, 409, { error: 'stop_not_owned' }, origin);
       if (!commands.includes(command) || Date.now() - command.createdAt >= STOP_COMMAND_TIMEOUT_MS || !await stopCommandCurrent(command.spec)) return json(res, 409, { error: 'stop_turn_changed' }, origin);
+      if (!commandMatchesCompanion(command.spec, browserOf(req), companionHost(req))) return json(res, 409, { error: 'external_browser_binding_mismatch' }, origin);
       return json(res, 200, { command: describe(command, client) }, origin);
     }
     if (revivalDeliveryProven(command)) {
@@ -4408,8 +4446,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const provenance = workerFamilyOrigin(command.spec.runId);
       if (external && provenance?.owner.kind === 'external_principal') {
         const principalId = provenance.owner.principalId;
-        const toolContext = () => externalPlacementToolContext(principalId, external, { roots: getConfig().roots,
-          caps: effectiveCapabilities(getConfig()), readOnly: getConfig().readOnly, setupProfileId: getConfig().tunnel.profileId ?? 'default' });
+        const toolContext = () => {
+          if (!commandExternalPlacement(command.spec)) throw new ExternalPrimeError('ACCESS_REVOKED', 'Worker command admission changed');
+          return externalPlacementToolContext(principalId, external, { roots: getConfig().roots,
+            caps: effectiveCapabilities(getConfig()), readOnly: getConfig().readOnly, setupProfileId: getConfig().tunnel.profileId ?? 'default' });
+        };
         const workspace = async () => {
           const resolved = await resolvePath(toolContext().roots, `/${external.workspaceRootId}`);
           toolContext();
@@ -4479,6 +4520,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if ((priorReceipt.conversationId ?? null) !== conversation) {
         return json(res, 409, { error: 'receipt_conversation_changed' }, origin);
       }
+      if (priorReceipt.externalStop) {
+        const placement = externalWorkerPlacement(priorReceipt.externalStop.familyId);
+        if (!placement || placement.browserBinding.browserId !== browserOf(req) || placement.browserBinding.kind !== companionHost(req)) return json(res, 409, { error: 'external_browser_binding_mismatch' }, origin);
+      }
       return json(res, 200, receiptReply(priorReceipt), origin);
     }
     const ownedCommand = commands.find((command) => command.id === id) ?? null;
@@ -4513,8 +4558,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (!client || conversation !== ownedCommand.spec.conversationId || body.turnId !== ownedCommand.spec.turnId)
         return json(res, 409, { error: 'stop_identity_changed' }, origin);
       const receipt: CommandReceipt = { id, client, conversationId: conversation, outcome: status === 'sent' ? 'committed' : 'terminal-failure',
-        committed: status === 'sent', error: status === 'sent' ? null : error || 'native_stop_unavailable', completedAt: Date.now() };
+        committed: status === 'sent', error: status === 'sent' ? null : error || 'native_stop_unavailable', completedAt: Date.now(), ...(ownedCommand.spec.expectedBinding ? { externalStop: structuredClone(ownedCommand.spec.expectedBinding) } : {}) };
+      if (!await stopCommandCurrent(ownedCommand.spec) || !commandMatchesCompanion(ownedCommand.spec, browserOf(req), companionHost(req))) return json(res, 409, { error: 'stop_identity_changed' }, origin);
       if (!await finalizeCommand(ownedCommand, receipt)) return json(res, 503, { error: 'command_receipt_not_durable' }, origin);
+      if (receipt.externalStop && receipt.committed) {
+        try { await recordExternalStopEvidence(receipt.externalStop, { browser: 'stopped' }); } catch { logWarn('External stop evidence persistence is unconfirmed'); }
+      }
       changed();
       return json(res, 200, receiptReply(receipt), origin);
     }
@@ -4522,7 +4571,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // The one moment at which the queued command and the conversation it became are
     // both in hand, and so the only chance to name that chat after the work rather
     // than after the bootstrap prompt about to be typed into it.
+    const ackKey = specKey(ownedCommand.spec);
+    const ackCurrent = () => commands.includes(ownedCommand) && specKey(ownedCommand.spec) === ackKey &&
+      (!client || ownedCommand.owner === client) && commandMatchesCompanion(ownedCommand.spec, browserOf(req), companionHost(req));
     const opened = status === 'sent' ? await commandOrigin(id) : null;
+    if (!ackCurrent()) return json(res, 409, { error: 'command_identity_changed' }, origin);
     if (conversation && opened) {
       await noteChatOrigin(conversation, opened).catch((err: Error) =>
         logWarn(`could not record the origin of a fresh chat: ${err.message}`)
@@ -4571,7 +4624,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           workerRevivalDeliveredSince(revive.agent, conversation, command.id, command.claimedAt, revive.runId);
         // The send is an *offer*, not an acknowledgement: the words are in the worker's chat,
         // and the worker's own next authenticated call is what retires them from its inbox.
-        const woke = alreadySent || (revival ? await mutateSwarm(() => noteWorkerRevived(revive.agent, conversation, revival.messageIds, command.id, revive.runId)) : false);
+        const woke = alreadySent || (revival ? await mutateSwarm(() => ackCurrent() ? noteWorkerRevived(revive.agent, conversation, revival.messageIds, command.id, revive.runId) : false) : false);
+        if (!ackCurrent()) return json(res, 409, { error: 'command_identity_changed' }, origin);
         if (woke) {
           receipt = {
             id,
@@ -5527,9 +5581,9 @@ export function shutdownBridge(): Promise<void> {
 // ------------------------------------------------------------------ commands
 
 function specKey(spec: CommandSpec): string {
-  if (spec.type === 'stop') return `stop:${spec.sessionId}:${spec.turnId}`;
-  if (spec.type === 'worker') return `worker:${spec.runId}:${spec.agent}`;
-  if (spec.type === 'revive') return `revive:${spec.runId}:${spec.agent}`;
+  if (spec.type === 'stop') return `stop:${spec.sessionId}:${spec.turnId}${spec.expectedBinding ? ':' + spec.expectedBinding.stopId + ':' + spec.expectedBinding.admissionRevision : ''}`;
+  if (spec.type === 'worker') return `worker:${spec.runId}:${spec.agent}${spec.externalAdmissionRevision !== undefined ? ':' + spec.externalAdmissionRevision : ''}`;
+  if (spec.type === 'revive') return `revive:${spec.runId}:${spec.agent}${spec.externalAdmissionRevision !== undefined ? ':' + spec.externalAdmissionRevision : ''}`;
   return `resume:${spec.sessionId}`;
 }
 
@@ -5722,6 +5776,7 @@ function receiptReply(receipt: CommandReceipt): Record<string, unknown> {
 async function finalizeCommand(command: Command, receipt: CommandReceipt): Promise<boolean> {
   return writeCommandTransition(command, async () => {
     if (!commands.includes(command)) return receiptFor(receipt.id) !== null;
+    if (command.spec.type === 'stop' && !externalStopTurnCurrent(command.spec)) return false;
     try {
       // The receipt and command retirement are one durable state transition. Publishing either
       // side in memory first recreates the lost-response ambiguity this tombstone exists to end.
@@ -5741,6 +5796,10 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
 }
 
 function queue(spec: CommandSpec): Command {
+  if (spec.type === 'worker' || spec.type === 'revive') {
+    const admission = externalWorkerCommandAdmission(spec.runId, spec.agent);
+    if (admission) spec = { ...spec, externalAdmissionRevision: admission.revision };
+  }
   const key = specKey(spec);
   const existing = commands.find((command) => specKey(command.spec) === key);
   if (existing) {
@@ -10231,6 +10290,12 @@ async function commandOrigin(id: string): Promise<SessionOrigin | null> {
  * take the queued tabs of its siblings with it — the whole-run form is what `onSwarmEnd`
  * uses, and pointing it at a single agent is what makes a per-worker clear safe.
  */
+/** Cleanup follows committed admission; the binding remains the security fence. */
+export function retireObsoleteExternalStops(familyId: string, workerId: string): void {
+  for (const command of [...commands]) {
+    if (command.spec.type === 'stop' && command.spec.expectedBinding?.familyId === familyId && command.spec.expectedBinding.workerId === workerId && !externalStopCurrent(command.spec.expectedBinding)) retire(command, 'external stop generation retired');
+  }
+}
 export function cancelWorkerCommands(reason: string, agent?: string, runId?: string): number {
   const doomed = commands.filter(
     (command) =>
@@ -10282,6 +10347,7 @@ interface CommandRestorePlan {
 
 /** One durable receipt that is still useful, rebuilt field-by-field. */
 function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandReceipt | null {
+  if ('externalStop' in raw && !externalStopBindingSchema.safeParse(raw.externalStop).success) return null;
   if (
     typeof raw.id !== 'string' || raw.id.length === 0 || raw.id.length > 64 ||
     (raw.client !== null && raw.client !== undefined && (typeof raw.client !== 'string' || raw.client.length > 64)) ||
@@ -10301,7 +10367,8 @@ function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandRece
     outcome: raw.outcome,
     committed: raw.committed,
     error: typeof raw.error === 'string' ? raw.error.slice(0, 200) : null,
-    completedAt: Number(raw.completedAt)
+    completedAt: Number(raw.completedAt),
+    ...(raw.externalStop && externalStopBindingSchema.safeParse(raw.externalStop).success ? { externalStop: externalStopBindingSchema.parse(raw.externalStop) } : {})
   };
 }
 
@@ -10314,6 +10381,8 @@ function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandRece
 function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): CommandSpec | null {
   if (raw.type === 'stop') {
     const stop = raw as Partial<Extract<CommandSpec, { type: 'stop' }>>;
+    // External stops never reacquire browser execution authority after restart.
+    if ('expectedBinding' in stop || (typeof stop.conversationId === 'string' && workerPrimeOwner(stop.conversationId).owner?.kind === 'external_principal')) return null;
     if (typeof stop.sessionId !== 'string' || !/^[a-z0-9-]{8,64}$/i.test(stop.sessionId) ||
         typeof stop.conversationId !== 'string' || !conversationId(stop.conversationId) ||
         typeof stop.turnId !== 'string' || !stop.turnId || stop.turnId.length > 256) return null;
@@ -10330,6 +10399,9 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
   ) {
     const worker = raw as Extract<CommandSpec, { type: 'worker' }>;
     if (!swarmRunning(worker.runId)) return null;
+    const admission = externalWorkerCommandAdmission(worker.runId, worker.agent);
+    if (worker.externalAdmissionRevision !== undefined && (!Number.isSafeInteger(worker.externalAdmissionRevision) || worker.externalAdmissionRevision < 0)) return null;
+    if (admission ? admission.stopped || admission.revision !== (worker.externalAdmissionRevision ?? 0) : worker.externalAdmissionRevision !== undefined) return null;
     // A retained transport may deliberately outlive its live queue entry while broker failure
     // is being fsynced. If restart sees the *newer* broker side first, a terminal/sleeping row is
     // proof this old bootstrap must not be resurrected merely because its run id still matches a
@@ -10346,7 +10418,8 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
       task: worker.task.slice(0, 512 * 1024),
       model: isModelSlug(worker.model) ? worker.model : null,
       reasoningEffort: isReasoningEffort(worker.reasoningEffort) ? worker.reasoningEffort : null,
-      runId: worker.runId
+      runId: worker.runId,
+      ...(worker.externalAdmissionRevision !== undefined ? { externalAdmissionRevision: worker.externalAdmissionRevision } : {})
     };
   }
   if (
@@ -10359,6 +10432,9 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
   ) {
     const revive = raw as Extract<CommandSpec, { type: 'revive' }>;
     if (!swarmRunning(revive.runId)) return null;
+    const admission = externalWorkerCommandAdmission(revive.runId, revive.agent);
+    if (revive.externalAdmissionRevision !== undefined && (!Number.isSafeInteger(revive.externalAdmissionRevision) || revive.externalAdmissionRevision < 0)) return null;
+    if (admission ? admission.stopped || admission.revision !== (revive.externalAdmissionRevision ?? 0) : revive.externalAdmissionRevision !== undefined) return null;
     if (agentConversation(revive.agent, revive.runId) !== revive.conversationId) return null;
     const revivalState = swarmState(revive.runId).agents.find((entry) => entry.id === revive.agent && entry.role === 'worker')?.state;
     if (revivalState !== 'waking' && revivalState !== 'active') return null;
@@ -10369,7 +10445,8 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
       runId: revive.runId,
       // A row written before wakes were named restores as the unnamed wake. The live broker
       // still holds the messages, so the next real wake for this worker supersedes it.
-      wake: typeof revive.wake === 'string' ? revive.wake : ''
+      wake: typeof revive.wake === 'string' ? revive.wake : '',
+      ...(revive.externalAdmissionRevision !== undefined ? { externalAdmissionRevision: revive.externalAdmissionRevision } : {})
     };
   }
   if (
@@ -10606,6 +10683,9 @@ export async function restoreCommands(): Promise<void> {
   // everything below may again use ordinary live command helpers and timers.
   commands = plan.commands;
   commandReceipts = plan.receipts;
+  for (const receipt of plan.receipts) {
+    if (receipt.externalStop && receipt.committed) await recordExternalStopEvidence(receipt.externalStop, { browser: 'stopped' });
+  }
   for (const token of plan.resumeTokens) rememberToken(token.sessionId, token.token);
   rearmRetainedCommandDeadlines();
   if (plan.restored > 0) {

@@ -7,8 +7,8 @@ const repo = process.cwd();
 describe('runtime multi-agent enable regression', () => {
   it('wires persistence before unconditional restore and preserves history while disabled', async () => {
     const source = await readFile(path.join(repo, 'src/main/index.ts'), 'utf8');
-    const persistSink = source.indexOf('onSwarmPersistNow((snapshot) => writeDurableNow(SWARM_STATE, snapshot))');
-    const restoreRead = source.indexOf('const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE)');
+    const persistSink = source.indexOf('onSwarmPersistNow((snapshot, options) => writeDurableNow(SWARM_STATE, snapshot, options))');
+    const restoreRead = source.indexOf('const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE, { strict: getConfig().externalPrime.principals.length > 0 })');
     const shutdownFence = source.indexOf('if (windowActivation.isDisabled()) return;', restoreRead);
     const restore = source.indexOf('restoreSwarm(savedSwarm)', restoreRead);
     const disabledPause = source.indexOf("pauseSwarmForDisable('multi-agent mode is disabled')");

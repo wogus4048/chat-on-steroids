@@ -3010,6 +3010,12 @@ export async function sessionDurableModifiedAt(id: string): Promise<number | nul
   return newest > 0 ? newest : null;
 }
 
+/** Synchronous publication fence for an already observed live session; absent cache is unknown. */
+export function currentSessionTurnBinding(id: string): { conversationId: string | null; activeTurnId: string | null } | null {
+  const summary = open.get(id)?.summary;
+  return summary ? { conversationId: summary.conversationId, activeTurnId: summary.activeTurnId ?? null } : null;
+}
+
 export async function getSession(id: string): Promise<SessionSummary | null> {
   assertSessionId(id);
   const summary = await readAuthoritativeSummary(id);

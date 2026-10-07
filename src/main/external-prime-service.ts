@@ -1,13 +1,16 @@
 /** Authenticated external operations over the existing broker; owns no runtime state. */
 import type { ExternalCaller } from '../shared/agent-owner.js';
 import { familyIdSchema } from '../shared/agent-owner.js';
-import { externalToolSchemas, externalDataSchemas, type SpawnArgs, type SpawnReceipt, type MessageArgs, type MessageReceipt, type StatusArgs, type StatusResult, type ReportQuery, type ReportPage, type AckArgs, type AckReceipt } from '../shared/external-prime.js';
+import { externalToolSchemas, externalDataSchemas, type SpawnArgs, type SpawnReceipt, type MessageArgs, type MessageReceipt, type StatusArgs, type StatusResult, type ReportQuery, type ReportPage, type AckArgs, type AckReceipt, type StopArgs, type StopReceipt } from '../shared/external-prime.js';
 import { isExternalCallerAuthenticated, ExternalPrimeError } from './external-prime-auth.js';
 import { getConfig } from './config.js';
 import { externalPlacementGrant } from './session/conversation-access.js';
 import { resolvePath } from './sandbox.js';
+import { findSessionByConversation } from './session/store.js';
+import { sessionControlsFor, stopSessionTurn, cancelWorkerCommands, retireObsoleteExternalStops } from './bridge.js';
+import { runningExecProcesses } from './codex/ownership.js';
 import { logWarn } from './logger.js';
-import { stageSpawn, stageMessages, runExternalMutation, resolveExternalFamily, requestWorkerBootstraps, requestWorkerRevivals, externalStatus, stageExternalReports, stageExternalAck, acceptStagedSwarmMutation, getExternalReceipt, measureSleepingWorkers, AgentError, type ExternalFamilyPlacement } from './agents.js';
+import { stageSpawn, stageExternalResumeMessage, stageExternalStop, externalWorkerForCaller, recordExternalStopEvidence, externalStopBindingCurrent, runExternalMutation, resolveExternalFamily, requestWorkerBootstraps, requestWorkerRevivals, externalStatus, stageExternalReports, stageExternalAck, acceptStagedSwarmMutation, getExternalReceipt, measureSleepingWorkers, AgentError, type ExternalFamilyPlacement } from './agents.js';
 
 function authorize(caller: ExternalCaller): void {
   if (!isExternalCallerAuthenticated(caller)) throw new ExternalPrimeError('ACCESS_REVOKED', 'External authentication is no longer active');
@@ -72,6 +75,7 @@ function resolveExternalFamilyForStage(runId: string, selector: SpawnArgs['famil
 export async function messageExternal(caller: ExternalCaller, raw: MessageArgs): Promise<MessageReceipt> {
   authorize(caller); const args = parse('workers_message', raw);
   if (!getExternalReceipt(caller, args.request_id)) {
+    if (externalWorkerForCaller(caller, args.family_id, args.worker_id).externalStopIntent && !args.resume) throw new ExternalPrimeError('ACCESS_REVOKED', 'Worker is explicitly stopped; resume:true is required');
     const family = resolveExternalFamily(caller, args.family_id);
     externalPlacementGrant(caller.principalId, family.placement, caller.setupProfileId);
     try { await measureSleepingWorkers(caller); } catch (error) { failure(error); }
@@ -85,12 +89,13 @@ export async function messageExternal(caller: ExternalCaller, raw: MessageArgs):
       const family = resolveExternalFamily(caller, args.family_id);
       externalPlacementGrant(caller.principalId, family.placement, caller.setupProfileId);
       // Ordinary sleep retains the legacy wake semantics. Explicit stop resume is Task 6.
-      const stage = stageMessages(caller, [{ to: args.worker_id, text: args.message }], args.family_id);
+      const stage = stageExternalResumeMessage(caller, args.family_id, args.worker_id, args.message, args.resume);
       publication = { ids: stage.waking, runId: stage.runId };
       return { ...stage, value: { operation: 'workers_message' as const, receipt: { request_id: args.request_id, family_id: args.family_id, worker_id: args.worker_id, status: 'accepted' as const } } };
     });
   } catch (error) { failure(error); }
   authorize(caller);
+  if (!accepted!.replayed) retireObsoleteExternalStops(args.family_id, args.worker_id);
   if (!accepted!.replayed && publication?.ids.length) {
     externalPlacementGrant(caller.principalId, resolveExternalFamily(caller, args.family_id).placement, caller.setupProfileId);
     try { requestWorkerRevivals(publication.ids, publication.runId); }
@@ -122,4 +127,46 @@ export async function ackExternal(caller: ExternalCaller, raw: AckArgs): Promise
   } catch (error) { failure(error); }
   authorize(caller);
   return externalDataSchemas.workers_ack.parse(accepted!.value.receipt);
+}
+
+export async function stopExternal(caller: ExternalCaller, raw: StopArgs): Promise<StopReceipt> {
+  authorize(caller); const args = parse('workers_stop', raw);
+  let publication: ReturnType<typeof stageExternalStop>['value'] | undefined;
+  let turnId: string | undefined, sessionId: string | undefined;
+  if (!getExternalReceipt(caller, args.request_id)) {
+    const worker = externalWorkerForCaller(caller, args.family_id, args.worker_id);
+    if (worker.conversationId) {
+      const session = await findSessionByConversation(worker.conversationId, { requireUnique: true });
+      if (session?.conversationId === worker.conversationId) {
+        sessionId = session.id;
+        try { turnId = (await sessionControlsFor(session.id)).activeTurnId ?? undefined; } catch { /* unobserved is unknown */ }
+      }
+    }
+  }
+  let accepted;
+  try { accepted = await runExternalMutation(caller, args.request_id, mutationInput('workers_stop', args), () => {
+    const family = resolveExternalFamily(caller, args.family_id);
+    const principal = externalPlacementGrant(caller.principalId, family.placement, caller.setupProfileId);
+    const stage = stageExternalStop(caller, args.family_id, args.worker_id, args.request_id, principal.policyRevision, turnId);
+    publication = stage.value;
+    return { ...stage, value: { operation: 'workers_stop' as const, receipt: { ...args, status: 'accepted' as const, admission: 'blocked' as const, browser: 'unknown' as const, processes: 'unknown' as const } } };
+  }); } catch (error) { failure(error); }
+  authorize(caller);
+  if (!accepted!.replayed && publication) {
+    const intent = publication.externalStopIntent!;
+    cancelWorkerCommands('external worker stopped', args.worker_id, intent.runId);
+    if (intent.conversationId && sessionId) {
+      const binding = { principalId: caller.principalId, familyId: args.family_id,
+        workerId: args.worker_id, runId: intent.runId, conversationId: intent.conversationId, policyRevision: intent.ownerRevision,
+        admissionRevision: publication.externalAdmissionRevision!, stopId: args.request_id };
+      try {
+        const currentSession = await findSessionByConversation(intent.conversationId, { requireUnique: true });
+        if (currentSession?.id !== sessionId || currentSession.conversationId !== intent.conversationId || !externalStopBindingCurrent(binding)) throw new Error('external_stop_binding_changed');
+        if (runningExecProcesses(sessionId).length) await recordExternalStopEvidence(binding, { processes: 'running' });
+        if (turnId) await stopSessionTurn(sessionId, turnId, binding);
+      }
+      catch { logWarn('External native stop delivery is unconfirmed; durable admission remains blocked'); }
+    }
+  }
+  return externalDataSchemas.workers_stop.parse(getExternalReceipt(caller, args.request_id)?.receipt ?? accepted!.value.receipt);
 }

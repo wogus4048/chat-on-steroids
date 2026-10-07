@@ -86,3 +86,10 @@ export type MessageReceipt = ExternalOutputs["workers_message"];
 export type StatusResult = ExternalOutputs["workers_status"];
 export type ReportPage = ExternalOutputs["workers_reports"];
 export type AckReceipt = ExternalOutputs["workers_ack"];
+
+export type StopArgs = ExternalInputs['workers_stop'];
+export type StopReceipt = ExternalOutputs['workers_stop'];
+export const externalStopBindingSchema = z.object({ principalId: principalIdSchema, familyId: familyIdSchema,
+  workerId: workerId, runId: uuid, conversationId: z.string().min(1).max(256), policyRevision: z.number().int().positive(),
+  admissionRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), stopId: requestIdSchema }).strict();
+export type ExternalStopBinding = z.infer<typeof externalStopBindingSchema>;

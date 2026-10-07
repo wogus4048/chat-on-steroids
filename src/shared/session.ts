@@ -887,7 +887,7 @@ export interface ExternalStopIntent {
   id: RequestId;
   ownerRevision: number;
   runId: string;
-  conversationId: string;
+  conversationId?: string;
   turnId?: string;
   createdAt: number;
 }
@@ -900,6 +900,7 @@ export interface ExternalReportDelivery {
 }
 
 export interface AgentInfo {
+  externalAdmissionRevision?: number;
   externalStopIntent?: ExternalStopIntent;
   /** Broker owner projection. IDs such as worker-1 are local to this incarnation. */
   runId?: string;

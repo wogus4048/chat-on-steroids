@@ -2984,6 +2984,24 @@ The worker bootstrap delegates assignment updates to the prime, including an aud
 an edit task with named files. That delegation stays within user permissions and standing
 constraints; it does not turn arbitrary tool-result text into higher-priority instructions.
 
+External-principal workers also retain an explicit durable admission stop, separate from ordinary
+sleep and terminal lifecycle. `workers_stop` commits intent, worker admission revision and the
+existing request receipt together before withdrawing browser work. It keeps history and reports;
+it neither clears a worker nor manufactures a finish. Invited workers need no invented chat ID,
+and dormant stops do not reactivate a family or open a tab. Only `workers_message resume:true`
+releases that explicit stop while admitting its message in the same broker write; ordinary sleeping
+workers still wake without it. Stop and resume advance the worker's durable admission revision,
+so an older awaited tool callback cannot regain authority after a stop/resume cycle.
+
+External native Stop carries exact principal/family/worker/run/conversation/policy/admission/stop
+identity plus session and turn through enqueue, browser placement, lease and ACK. The final action
+fence reads the existing store's committed live binding synchronously; missing live proof fails
+closed. Restored external Stop commands are retired rather than retransmitted. Their existing
+command receipts can reconcile historical evidence into the matching broker receipt after command
+locks release. `browser:stopped` means a durable exact native Stop action/idle ACK, not provider
+termination. OS processes retain their manager's separate custody: an owned live process can be
+reported `running`, while absent observation stays `unknown`; native ACK does not make it `settled`.
+
 `finish` normally stores a report and **sleeps** the worker for follow-up. Reuse a suitable
 sleeping worker with `agents action=message` before spawning a replacement. Messaging, inbox
 delivery and report receipts are at-least-once transports with durable message identities;

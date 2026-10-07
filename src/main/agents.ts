@@ -17,7 +17,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { AgentOwner, Caller, ChatGptCaller, ExternalCaller, FamilyId, RequestId } from '../shared/agent-owner.js';
 import { agentOwnerSchema, familyIdSchema, principalIdSchema, requestIdSchema, receiptIdSchema, reportIdSchema } from '../shared/agent-owner.js';
-import { EXTERNAL_PRIME_LIMITS, externalMutationReceiptSchema, browserBindingSchema, workspaceRootIdSchema, setupProfileIdSchema, type ExternalMutationReceipt, type StatusArgs, type StatusResult, type ReportQuery, type ReportPage, type AckArgs, type AckReceipt } from '../shared/external-prime.js';
+import { EXTERNAL_PRIME_LIMITS, externalMutationReceiptSchema, browserBindingSchema, workspaceRootIdSchema, setupProfileIdSchema, type ExternalMutationReceipt, type StatusArgs, type StatusResult, type ReportQuery, type ReportPage, type AckArgs, type AckReceipt, type ExternalStopBinding } from '../shared/external-prime.js';
 import { isExternalCallerAuthenticated, ExternalPrimeError } from './external-prime-auth.js';
 export type { Caller } from '../shared/agent-owner.js';
 import type { AgentInfo, AgentMessage, AgentState, ReasoningEffort, SwarmState } from '../shared/session.js';
@@ -433,12 +433,13 @@ interface FinishStageState {
 }
 const activeFinishStages = new Map<Agent, FinishStageState>();
 /** Speculative inbox projection, owned by the existing acceptance lane. Never a delivery queue. */
+const externalInfoProposals = new Map<Agent, Partial<AgentInfo>>();
 const externalInboxProposals = new Map<AgentMessage, AgentMessage>();
 
 export interface StagedMutation<T> { value: T; commit(): void | boolean; rollback(): void }
 export interface MutationReceipt<T> { value: T; replayed: boolean }
 const externalStopIntentSchema = z.object({ id: requestIdSchema, ownerRevision: z.number().int().positive(),
-  runId: z.string().uuid(), conversationId: z.string().min(1).max(256), turnId: z.string().min(1).max(256).optional(), createdAt: z.number().finite().nonnegative() }).strict();
+  runId: z.string().uuid(), conversationId: z.string().min(1).max(256).optional(), turnId: z.string().min(1).max(256).optional(), createdAt: z.number().finite().nonnegative() }).strict().refine(value => !value.turnId || !!value.conversationId);
 const externalReportSchema = z.object({ id: reportIdSchema, revision: z.number().int().positive() }).strict();
 const externalReportDeliverySchema = z.object({ id: receiptIdSchema, revision: z.number().int().positive(),
   deliveredAt: z.number().finite().nonnegative(), ackedAt: z.number().finite().nonnegative().optional() }).strict();
@@ -447,11 +448,13 @@ const externalLedgerRecordSchema = z.object({
   requestId: requestIdSchema, operation: z.enum(['workers_spawn', 'workers_message', 'workers_ack', 'workers_stop']),
   inputHash: z.string().regex(/^[a-f0-9]{64}$/), familyId: familyIdSchema,
   workerId: z.string().max(64).optional(), status: z.enum(['accepted', 'unknown', 'settled']),
+  stopAdmissionRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
   createdAt: z.number().finite().nonnegative(), deletedAt: z.number().finite().nonnegative().optional(),
   receipt: externalMutationReceiptSchema
 }).strict();
 export type ExternalLedgerRecord = z.infer<typeof externalLedgerRecordSchema>;
 const externalLedgers = new Map<string, Map<string, ExternalLedgerRecord>>();
+const externalReceiptProposals = new Map<ExternalLedgerRecord, ExternalMutationReceipt>();
 const unpublishedExternalRecords = new Set<ExternalLedgerRecord>();
 const quarantinedExternalLedgers = new Set<string>();
 let externalLedgerCorrupt = false;
@@ -500,6 +503,11 @@ export function runExternalMutation<T extends ExternalMutationReceipt>(caller: E
       record = { requestId, operation: value.operation, inputHash, familyId: value.receipt.family_id,
         ...('worker_id' in value.receipt ? { workerId: value.receipt.worker_id } : {}),
         status: value.receipt.status, createdAt: Date.now(), receipt: value };
+      if (value.operation === 'workers_stop') {
+        const family = externalFamily(caller, value.receipt.family_id, true);
+        const worker = family.agents.get(value.receipt.worker_id);
+        record.stopAdmissionRevision = worker ? externalInfoProposals.get(worker)?.externalAdmissionRevision : undefined;
+      }
       if (Buffer.byteLength(JSON.stringify(record)) > 2048) throw new ExternalPrimeError('CAPACITY_EXCEEDED', 'External receipt exceeds its durable record bound');
       externalLedgers.set(caller.principalId, ledger);
       ledger.set(requestId, record); unpublishedExternalRecords.add(record); changed();
@@ -933,6 +941,14 @@ export function workerFamilyOrigin(runId: string): { owner: AgentOwner; familyId
 }
 
 /** Internal detached placement projection; family addresses select state, never grant access. */
+export function externalWorkerCommandAdmission(runId: string, workerId: string): { revision: number; stopped: boolean } | null {
+  const family = allFamilies().find(row => familyKey(row) === runId);
+  if (family?.owner.kind !== 'external_principal') return null;
+  const worker = family.agents.get(workerId);
+  const revision = worker?.info.externalAdmissionRevision ?? 0;
+  if (!worker || worker.info.role !== 'worker' || !Number.isSafeInteger(revision) || revision < 0) return { revision: -1, stopped: true };
+  return { revision, stopped: !!worker.info.externalStopIntent };
+}
 export function externalWorkerPlacement(familyId: FamilyId): ExternalFamilyPlacement | null {
   const family = allFamilies().find(row => row.familyId === familyId && row.owner.kind === 'external_principal' &&
     !unpublishedRuns.has(row as Run));
@@ -946,6 +962,76 @@ export function workerOwner(conversationId: string): AgentOwner | null {
 export function resolveExternalFamily(caller: ExternalCaller, familyId: FamilyId): { familyId: FamilyId; runId: string; owner: AgentOwner; placement?: ExternalFamilyPlacement } {
   const family = externalFamily(caller, familyId);
   return { familyId: family.familyId, runId: familyKey(family), owner: { ...family.owner }, placement: family.externalPlacement ? structuredClone(family.externalPlacement) : undefined };
+}
+
+/** Existing broker row is the sole owner of admission generations. */
+export function externalWorkerForCaller(caller: ExternalCaller, familyId: FamilyId, workerId: string): AgentInfo {
+  const family = externalFamily(caller, familyId);
+  const worker = family.agents.get(workerId);
+  if (!worker || worker.info.role !== 'worker' || unpublishedAgents.has(worker)) throw new ExternalPrimeError('NOT_FOUND', 'Worker unavailable');
+  return structuredClone(worker.info);
+}
+function stageExternalInfo(family: Family, worker: Agent, proposal: Partial<AgentInfo>): StagedMutation<AgentInfo> {
+  if (externalInfoProposals.has(worker)) throw new ExternalPrimeError('ACCESS_REVOKED', 'Worker transition pending');
+  externalInfoProposals.set(worker, proposal);
+  let settled = false;
+  return { value: { ...worker.info, ...proposal }, commit() {
+    if (settled) return; settled = true;
+    if (!allFamilies().includes(family) || family.agents.get(worker.info.id) !== worker) return false;
+    Object.assign(worker.info, proposal); externalInfoProposals.delete(worker); changed();
+  }, rollback() { if (settled) return; settled = true; externalInfoProposals.delete(worker); changed(); } };
+}
+function nextAdmissionRevision(info: AgentInfo): number {
+  const value = info.externalAdmissionRevision ?? 0;
+  if (!Number.isSafeInteger(value) || value < 0 || value >= Number.MAX_SAFE_INTEGER) throw new ExternalPrimeError('ACCESS_REVOKED', 'Worker admission generation unavailable');
+  return value + 1;
+}
+export function stageExternalStop(caller: ExternalCaller, familyId: FamilyId, workerId: string, stopId: RequestId, policyRevision: number, turnId?: string): StagedMutation<AgentInfo> {
+  externalFamily(caller, familyId); externalWorkerForCaller(caller, familyId, workerId);
+  return stageOwnedWorkerStop(caller.principalId, familyId, workerId, stopId, policyRevision, turnId);
+}
+/** Internal local settlement can reuse the same stage without fabricating an authenticated caller. */
+export function stageOwnedWorkerStop(principalId: string, familyId: FamilyId, workerId: string, stopId: RequestId, policyRevision: number, turnId?: string): StagedMutation<AgentInfo> {
+  const family = allFamilies().find(row => row.familyId === familyId && row.owner.kind === 'external_principal' && row.owner.principalId === principalId);
+  const worker = family?.agents.get(workerId);
+  if (!family || !worker || worker.info.role !== 'worker' || unpublishedAgents.has(worker)) throw new ExternalPrimeError('NOT_FOUND', 'Worker unavailable');
+  return stageExternalInfo(family, worker, { externalAdmissionRevision: nextAdmissionRevision(worker.info), externalStopIntent: {
+    id: stopId, ownerRevision: policyRevision, runId: familyKey(family),
+    ...(worker.info.conversationId ? { conversationId: worker.info.conversationId, ...(turnId ? { turnId } : {}) } : {}), createdAt: Date.now() } });
+}
+export function stageExternalResumeMessage(caller: ExternalCaller, familyId: FamilyId, workerId: string, message: string, resume: boolean): StagedAgentMessages {
+  const family = externalFamily(caller, familyId); const info = externalWorkerForCaller(caller, familyId, workerId);
+  if (info.externalStopIntent && !resume) throw new ExternalPrimeError('ACCESS_REVOKED', 'Worker is explicitly stopped; resume:true is required');
+  const worker = family.agents.get(workerId)!;
+  const proposal = info.externalStopIntent ? { externalAdmissionRevision: nextAdmissionRevision(info), externalStopIntent: undefined } : undefined;
+  const stage = stageMessages(caller, [{ to: workerId, text: message }], familyId);
+  const currentFamily = allFamilies().find(row => row.agents.get(workerId) === worker)!;
+  const admission = proposal ? stageExternalInfo(currentFamily, worker, proposal) : undefined;
+  return { ...stage, commit() { if (stage.commit() === false) return false; return admission?.commit(); }, rollback() { stage.rollback(); admission?.rollback(); } };
+}
+/** Historical exact command evidence updates only its existing receipt, never worker authority. */
+export function recordExternalStopEvidence(binding: ExternalStopBinding, evidence: { browser?: 'stopped'; processes?: 'running' }): Promise<void> {
+  return inAcceptanceLane(async () => {
+    const record = externalLedgers.get(binding.principalId)?.get(binding.stopId);
+    if (!record || record.operation !== 'workers_stop' || record.familyId !== binding.familyId || record.workerId !== binding.workerId ||
+      record.stopAdmissionRevision !== binding.admissionRevision || record.receipt.operation !== 'workers_stop') return;
+    if ((!evidence.browser || record.receipt.receipt.browser === evidence.browser) && (!evidence.processes || record.receipt.receipt.processes === evidence.processes)) return;
+    const next = { ...record.receipt.receipt, ...evidence };
+    const proposal: ExternalMutationReceipt = { operation: 'workers_stop', receipt: next };
+    externalReceiptProposals.set(record, proposal);
+    try { if (!await persistExactSwarm(false)) throw new Error('Stop evidence persistence unavailable'); }
+    catch (error) { externalReceiptProposals.delete(record); throw error; }
+    record.receipt = proposal; externalReceiptProposals.delete(record);
+    changed();
+  });
+}
+
+export function externalStopBindingCurrent(binding: ExternalStopBinding): boolean {
+  const worker = workerPrimeOwner(binding.conversationId);
+  return worker.owner?.kind === 'external_principal' && worker.owner.principalId === binding.principalId &&
+    worker.familyId === binding.familyId && worker.workerId === binding.workerId && worker.runId === binding.runId &&
+    worker.admissionRevision === binding.admissionRevision && worker.stopIntent?.id === binding.stopId &&
+    worker.stopIntent.runId === binding.runId && worker.stopIntent.conversationId === binding.conversationId && worker.stopIntent.ownerRevision === binding.policyRevision;
 }
 
 function externalCursor(kind: string, caller: ExternalCaller, selector: string | null, fingerprint: string, position: number): string {
@@ -2587,7 +2673,7 @@ export interface StagedAgentMessages {
    */
   waking: string[];
   /** Makes the already-durable queue entries visible to the recipient. Pure in-memory publish. */
-  commit: () => void;
+  commit: () => void | boolean;
   /** Removes an unaccepted batch and supersedes any failed durable snapshot with the safe state. */
   rollback: () => void;
 }
@@ -4793,6 +4879,9 @@ export function primeForOwnedConversation(conversationId: string): string | null
 }
 
 export interface WorkerPrimeOwner {
+  workerId?: string;
+  admissionRevision?: number;
+  stopIntent?: AgentInfo["externalStopIntent"];
   owner?: AgentOwner;
   familyId?: FamilyId;
   externalPlacement?: ExternalFamilyPlacement;
@@ -4824,7 +4913,12 @@ export function workerPrimeOwner(conversationId: string): WorkerPrimeOwner {
   if (owners.length === 0) return { owned: false, primeConversationId: null, runId: null };
   if (owners.length !== 1) return { owned: true, primeConversationId: null, runId: null };
   const owner = owners[0]!;
+  const matches = [...owner.agents.values()].filter(agent => agent.info.role === 'worker' && agent.info.conversationId === conversationId);
+  if (matches.length !== 1) return { owned: true, primeConversationId: null, runId: null };
+  const worker = matches[0]!.info;
   return {
+    workerId: worker.id, admissionRevision: worker.externalAdmissionRevision ?? 0,
+    stopIntent: worker.externalStopIntent ? structuredClone(worker.externalStopIntent) : undefined,
     owned: true,
     owner: { ...owner.owner },
     familyId: owner.familyId,
@@ -5246,7 +5340,7 @@ function buildSwarmSnapshot(includeUnpublished: boolean): SwarmSnapshot | null {
   const quarantinedWorkers = [...retiredWorkers.values()].filter(worker => worker.quarantine).map(worker => ({ ...worker }));
   const ledgers = [...externalLedgers].map(([principalId, records]) => ({ principalId,
     ...(quarantinedExternalLedgers.has(principalId) ? { quarantined: true } : {}),
-    records: [...records.values()].filter(record => includeUnpublished || !unpublishedExternalRecords.has(record)).map(record => structuredClone(record))
+    records: [...records.values()].filter(record => includeUnpublished || !unpublishedExternalRecords.has(record)).map(record => structuredClone(includeUnpublished && externalReceiptProposals.has(record) ? { ...record, receipt: externalReceiptProposals.get(record)! } : record))
   })).filter(ledger => ledger.records.length > 0 || ledger.quarantined);
   if (active.length === 0 && dormant.length === 0 && ledgers.length === 0 && !externalLedgerCorrupt && quarantinedWorkers.length === 0) return null;
   // Legacy top-level projection is deliberately empty with multiple owners. Version 6 readers
@@ -5289,6 +5383,7 @@ function serializeAgents(agents: Map<string, Agent>, includeUnpublished: boolean
               silenceRecoveryRequestOriginMax: finish.info.silenceRecoveryRequestOriginMax
             }
           : { ...agent.info };
+      if (includeUnpublished) Object.assign(info, externalInfoProposals.get(agent));
       const finishAcknowledged =
         includeUnpublished && finish && !finish.settled && finish.run.agents === agents
           ? new Set(finish.acknowledgedMessageIds)
@@ -5363,6 +5458,8 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
   unpublishedRuns.clear();
   activeSpawnStages.clear();
   activeFinishStages.clear();
+  externalReceiptProposals.clear();
+  externalInfoProposals.clear();
   externalInboxProposals.clear();
   externalLedgers.clear();
   unpublishedExternalRecords.clear();
@@ -5449,7 +5546,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
       const deliveryIds = restoredDeliveryIds.get(owner.principalId) ?? new Set<string>();
       restoredReportIds.set(owner.principalId, reportIds); restoredDeliveryIds.set(owner.principalId, deliveryIds);
       const rows = saved.agents?.flatMap(agent => agent.queue ?? []) ?? [];
-      let corrupt = saved.agents?.some(agent => agent.info?.externalStopIntent !== undefined && !externalStopIntentSchema.safeParse(agent.info.externalStopIntent).success) ?? false;
+      let corrupt = saved.agents?.some(agent => (agent.info?.externalStopIntent !== undefined && !externalStopIntentSchema.safeParse(agent.info.externalStopIntent).success) || (agent.info?.externalAdmissionRevision !== undefined && (!Number.isSafeInteger(agent.info.externalAdmissionRevision) || agent.info.externalAdmissionRevision < 0))) ?? false;
       for (const message of rows) {
         const report = message.externalReport;
         const delivery = message.externalDelivery;
@@ -5666,6 +5763,7 @@ function deserializeAgents(entries: readonly SerializedAgent[], savedAt: number)
     const agent: Agent = {
       info: {
         ...entry.info,
+        externalAdmissionRevision: entry.info.externalAdmissionRevision,
         externalStopIntent: externalStopIntentSchema.safeParse(entry.info.externalStopIntent).success ? structuredClone(entry.info.externalStopIntent) : undefined,
         model: isModelSlug(entry.info.model) ? entry.info.model : null,
         reasoningEffort: isReasoningEffort(entry.info.reasoningEffort) ? entry.info.reasoningEffort : null,
@@ -5744,6 +5842,8 @@ export function resetAgentsForTests(): void {
   unpublishedRuns.clear();
   activeSpawnStages.clear();
   activeFinishStages.clear();
+  externalReceiptProposals.clear();
+  externalInfoProposals.clear();
   externalInboxProposals.clear();
   retiredWorkers.clear();
   livenessFloor = 0;

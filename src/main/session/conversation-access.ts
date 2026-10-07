@@ -17,7 +17,7 @@ export function captureExternalWorkerAdmission(conversationId: string | null | u
   const initial = externalWorkerGrant(conversationId);
   if (!initial || !conversationId) return undefined;
   const owner = { principalId: initial.principal.principalId, familyId: initial.worker.familyId,
-    runId: initial.worker.runId, revision: initial.principal.policyRevision };
+    runId: initial.worker.runId, workerId: initial.worker.workerId, admissionRevision: initial.worker.admissionRevision, revision: initial.principal.policyRevision };
   const policyIdentity = () => {
     const config = getConfig();
     const current = externalWorkerGrant(conversationId);
@@ -29,7 +29,7 @@ export function captureExternalWorkerAdmission(conversationId: string | null | u
   return (capabilities, target) => {
     if (isChatBlocked(conversationId)) throw new ExternalPrimeError('ACCESS_REVOKED', 'External worker is blocked.');
     const current = externalWorkerGrant(conversationId);
-    if (!current || current.worker.familyId !== owner.familyId || current.worker.runId !== owner.runId ||
+    if (!current || current.worker.familyId !== owner.familyId || current.worker.runId !== owner.runId || current.worker.workerId !== owner.workerId || current.worker.admissionRevision !== owner.admissionRevision ||
       current.principal.principalId !== owner.principalId || current.principal.policyRevision !== owner.revision || policyIdentity() !== generation) {
       throw new ExternalPrimeError('ACCESS_REVOKED', 'External worker authority changed while this call was pending.');
     }
@@ -63,7 +63,8 @@ export function externalWorkerGrant(conversationId: string | null | undefined): 
   const worker = conversationId ? workerPrimeOwner(conversationId) : null;
   if (worker?.owned && !worker.owner) throw new ExternalPrimeError('ACCESS_REVOKED', 'No unique worker owner is proven.');
   if (worker?.owner?.kind !== 'external_principal') return null;
-  if (!worker.familyId || !worker.runId) throw new ExternalPrimeError('ACCESS_REVOKED', 'External worker provenance unavailable.');
+  if (worker.stopIntent) throw new ExternalPrimeError('ACCESS_REVOKED', 'External worker is explicitly stopped.');
+  if (!worker.familyId || !worker.runId || !worker.workerId || !Number.isSafeInteger(worker.admissionRevision)) throw new ExternalPrimeError('ACCESS_REVOKED', 'External worker provenance unavailable.');
   return { principal: externalPlacementGrant(worker.owner.principalId, worker.externalPlacement, worker.setupProfileId), worker };
 }
 

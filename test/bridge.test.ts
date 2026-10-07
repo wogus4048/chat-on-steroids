@@ -1,3 +1,4 @@
+import { requestIdSchema } from '../src/shared/agent-owner.js';
 /**
  * The local bridge, over real HTTP.
  *
@@ -15210,4 +15211,159 @@ describe('external worker exact browser placement', () => {
     expect(broker.workerPrimeOwner(conversationId).owner?.kind).toBe('external_principal');
   });
 
+});
+
+describe('external worker exact stop custody', () => {
+  const browser = '0123456789abcdef';
+  const endpoint = { browser, host: 'browser' };
+  async function externalActive() {
+    const { createExternalPrincipal, authenticateExternal } = await import('../src/main/external-prime-auth.js');
+    const service = await import('../src/main/external-prime-service.js');
+    const broker = await import('../src/main/agents.js');
+    await saveConfig({ ...getConfig(), roots: [{ name: 'project', path: dir }], externalPrime: { enabled: true, principals: [] } });
+    const caller = authenticateExternal((await createExternalPrincipal({ label: 'fixture', rootIds: ['project'], capabilities: ['read'], browserBinding: { kind: 'extension', browserId: browser }, setupProfileId: 'default' })).token);
+    const worker = await service.spawnExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family: { new: true }, task: 'review', workspace_root_id: 'project' });
+    const conversationId = randomUUID(); broker.bindConversation(worker.worker_id, conversationId, worker.run_id);
+    await pair();
+    const live = await request('POST', '/events', { ...endpoint, body: { conversationId, events: [{ kind: 'turn_start', time: Date.now(), turnId: 'external-turn' }] } });
+    return { caller, worker, conversationId, sessionId: live.body.sessionId as string, service, broker };
+  }
+  it('keeps enqueue unknown, enforces exact browser on publication/redeem/ACK and records native evidence', async () => {
+    const { caller, worker, service } = await externalActive();
+    const stop = await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+    expect(stop).toMatchObject({ browser: 'unknown', processes: 'unknown', admission: 'blocked' }); expect(recoveryBrowserWake).not.toHaveBeenCalled();
+    expect((await request('GET', '/status', { browser: 'fedcba9876543210', host: 'browser' })).body.stopTurns).toEqual([]);
+    const command = (await request('GET', '/status', endpoint)).body.stopTurns[0]; expect(command).toBeTruthy();
+    const wrong = await request('POST', '/commands/redeem', { browser: 'fedcba9876543210', host: 'browser', body: { id: command.id, client: 'stop-page', conversationId: command.conversationId } }); expect(wrong.status).toBe(409);
+    expect((await request('POST', '/commands/redeem', { ...endpoint, body: { id: command.id, client: 'stop-page', conversationId: command.conversationId } })).status).toBe(200);
+    const ack = { id: command.id, client: 'stop-page', conversationId: command.conversationId, turnId: 'external-turn', status: 'sent' };
+    expect((await request('POST', '/commands/ack', { browser: 'fedcba9876543210', host: 'browser', body: ack })).status).toBe(409);
+    expect((await request('POST', '/commands/ack', { ...endpoint, body: ack })).status).toBe(200);
+    expect(service.statusExternal(caller, { request_id: stop.request_id })).toMatchObject({ receipt: { browser: 'stopped', processes: 'unknown', status: 'accepted' } });
+  });
+  it('rejects resume during the first post-commit session await without enqueuing another target', async () => {
+    const { caller, worker, service, broker } = await externalActive();
+    let entered!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; }); const gate = new Promise<void>(resolve => { release = resolve; });
+    const original = sessionStoreModule.getSession; let held = false;
+    const spy = vi.spyOn(sessionStoreModule, 'getSession').mockImplementation(async (...params) => {
+      if (!held && broker.workerPrimeOwner((await original(params[0]))?.conversationId ?? '').stopIntent) { held = true; entered(); await gate; }
+      return original(...params);
+    });
+    try {
+      const stopping = service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+      await ready;
+      await service.messageExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id, message: 'resume', resume: true });
+      release(); expect(await stopping).toMatchObject({ browser: 'unknown' });
+      expect(pendingCommands().some(row => row.what.startsWith('stop:'))).toBe(false);
+    } finally { release(); spy.mockRestore(); }
+  });
+  it('keeps owned running processes separate from native ACK and repairs historical evidence after restart', async () => {
+    const { caller, worker, service, broker } = await externalActive();
+    const ownership = await import('../src/main/codex/ownership.js');
+    const processes = vi.spyOn(ownership, 'runningExecProcesses').mockReturnValue([{ processId: 17, incarnation: 1, command: 'fixture server', startedAt: Date.now(), tty: false }]);
+    try {
+      const stop = await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+      expect(stop.processes).toBe('running'); expect(stop.processes).not.toBe('settled');
+      const command = (await request('GET', '/status', endpoint)).body.stopTurns[0];
+      await request('POST', '/commands/redeem', { ...endpoint, body: { id: command.id, client: 'evidence-page', conversationId: command.conversationId } });
+      onSwarmPersistNow(async () => { throw new Error('evidence disk'); });
+      expect((await request('POST', '/commands/ack', { ...endpoint, body: { id: command.id, client: 'evidence-page', conversationId: command.conversationId, turnId: 'external-turn', status: 'sent' } })).status).toBe(200);
+      expect(service.statusExternal(caller, { request_id: stop.request_id })).toMatchObject({ receipt: { browser: 'unknown', processes: 'running' } });
+      await flushDurable(); const snapshot = broker.snapshotSwarm(); resetBridgeForTests(); broker.restoreSwarm(snapshot);
+      onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options)); await restoreCommands();
+      expect(service.statusExternal(caller, { request_id: stop.request_id })).toMatchObject({ receipt: { browser: 'stopped', processes: 'running', status: 'accepted' } });
+      expect(pendingCommands().some(row => row.what.startsWith('stop:'))).toBe(false);
+    } finally { processes.mockRestore(); onSwarmPersistNow((snapshot, options) => writeDurableNow('swarm', snapshot, options)); }
+  });
+  it('does not combine old same-turn stop lease or ACK with a resumed new stop', async () => {
+    const { caller, worker, service } = await externalActive();
+    const first = await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+    const old = (await request('GET', '/status', endpoint)).body.stopTurns[0];
+    await request('POST', '/commands/redeem', { ...endpoint, body: { id: old.id, client: 'old-stop-page', conversationId: old.conversationId } });
+    await service.messageExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id, message: 'resume', resume: true });
+    // A new observed turn is required to earn a fresh stop target after the old activity was retired.
+    await request('POST', '/events', { ...endpoint, body: { conversationId: old.conversationId, events: [{ kind: 'turn_start', time: Date.now(), turnId: 'external-next-turn' }] } });
+    const second = await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+    const fresh = (await request('GET', '/status', endpoint)).body.stopTurns[0]; expect(fresh.id).not.toBe(old.id);
+    expect((await request('POST', '/commands/ack', { ...endpoint, body: { id: old.id, client: 'old-stop-page', conversationId: old.conversationId, turnId: 'external-turn', status: 'sent' } })).status).not.toBe(200);
+    expect(service.statusExternal(caller, { request_id: first.request_id })).toMatchObject({ receipt: { browser: 'unknown' } });
+    expect(service.statusExternal(caller, { request_id: second.request_id })).toMatchObject({ receipt: { browser: 'unknown' } });
+  });
+  it.each(['enqueue', 'handout'] as const)('fences a committed new turn after a copied session read at %s', async boundary => {
+    const { caller, worker, service, broker, sessionId, conversationId } = await externalActive();
+    let entered!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; }); const gate = new Promise<void>(resolve => { release = resolve; });
+    let held = false;
+    let pending: Promise<any>; let spy: { mockRestore(): void };
+    if (boundary === 'enqueue') {
+      const original = sessionStoreModule.conversationWasSuperseded;
+      spy = vi.spyOn(sessionStoreModule, 'conversationWasSuperseded').mockImplementation(async id => {
+        if (!held && id === conversationId && broker.workerPrimeOwner(id).stopIntent) { held = true; entered(); await gate; }
+        return original(id);
+      });
+      pending = service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+    } else {
+      await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+      const original = sessionStoreModule.getSession;
+      spy = vi.spyOn(sessionStoreModule, 'getSession').mockImplementation(async id => {
+        const copied = await original(id);
+        if (!held && id === sessionId) { held = true; entered(); await gate; }
+        return copied;
+      });
+      pending = request('GET', '/status', endpoint);
+    }
+    try {
+      await ready;
+      await sessionStoreModule.appendEvent(sessionId, { kind: 'turn_start', source: 'extension', time: Date.now(), turnId: 'new-committed-turn' });
+      release(); const result = await pending;
+      if (boundary === 'enqueue') expect(result.browser).toBe('unknown'); else expect(result.body.stopTurns).toEqual([]);
+      expect((await request('GET', '/status', endpoint)).body.stopTurns).toEqual([]);
+    } finally { release(); spy.mockRestore(); }
+  });
+  it('does not revive an old undelivered bootstrap after stop resume when cancellation is unavailable', async () => {
+    const { caller, service } = await externalActive();
+    const worker = await service.spawnExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family: { new: true }, task: 'invited', workspace_root_id: 'project' });
+    const bridge = await import('../src/main/bridge.js');
+    const original = bridge.queueWorkerBootstrap(worker.worker_id, 'invited', null, null, worker.run_id)!;
+    const cancel = vi.spyOn(bridge, 'cancelWorkerCommands').mockReturnValue(0);
+    try {
+      await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+      await service.messageExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id, message: 'resume invited', resume: true });
+      expect((await request('POST', '/commands/redeem', { ...endpoint, body: { id: original.id, client: 'old-bootstrap-page' } })).status).toBe(409);
+    } finally { cancel.mockRestore(); }
+  });
+  it.each(['malformed', 'legacy'] as const)('does not downgrade a restored %s external stop to GPT custody', async damage => {
+    const { caller, worker, service, broker } = await externalActive();
+    await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+    await flushDurable(); const durable = await import('../src/main/durable.js');
+    const saved = await durable.readDurable<any>('bridge-commands');
+    const row = saved.commands.find((value: any) => value.spec.type === 'stop');
+    if (damage === 'malformed') row.spec.expectedBinding = { principalId: 'broken' }; else delete row.spec.expectedBinding;
+    await writeDurableNow('bridge-commands', saved); const snapshot = broker.snapshotSwarm(); resetBridgeForTests(); broker.restoreSwarm(snapshot); await restoreCommands();
+    expect(pendingCommands().some(row => row.what.startsWith('stop:'))).toBe(false);
+  });
+  it('does not publish native evidence when the exact command receipt write fails', async () => {
+    const { caller, worker, service } = await externalActive();
+    const stop = await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+    const command = (await request('GET', '/status', endpoint)).body.stopTurns[0];
+    await request('POST', '/commands/redeem', { ...endpoint, body: { id: command.id, client: 'failed-receipt-page', conversationId: command.conversationId } });
+    const durable = await import('../src/main/durable.js'); const original = durable.writeDurableNow;
+    const fail = vi.spyOn(durable, 'writeDurableNow').mockImplementation(async (...params) => {
+      if (params[0] === 'bridge-commands') throw new Error('receipt disk'); return original(...params);
+    });
+    try {
+      expect((await request('POST', '/commands/ack', { ...endpoint, body: { id: command.id, client: 'failed-receipt-page', conversationId: command.conversationId, turnId: 'external-turn', status: 'sent' } })).status).toBe(503);
+      expect(service.statusExternal(caller, { request_id: stop.request_id })).toMatchObject({ receipt: { browser: 'unknown', processes: 'unknown' } });
+    } finally { fail.mockRestore(); }
+  });
+  it.each(['queued', 'leased'] as const)('retires restored %s external stops without replay and reconciles durable evidence only', async phase => {
+    const { caller, worker, service, broker } = await externalActive();
+    const stop = await service.stopExternal(caller, { request_id: requestIdSchema.parse(randomUUID()), family_id: worker.family_id, worker_id: worker.worker_id });
+    const command = (await request('GET', '/status', endpoint)).body.stopTurns[0];
+    if (phase === 'leased') await request('POST', '/commands/redeem', { ...endpoint, body: { id: command.id, client: 'restore-stop-page', conversationId: command.conversationId } });
+    await flushDurable(); const snapshot = broker.snapshotSwarm(); resetBridgeForTests(); broker.restoreSwarm(snapshot); await restoreCommands();
+    expect(pendingCommands().some(row => row.what.startsWith('stop:'))).toBe(false); expect(recoveryBrowserWake).not.toHaveBeenCalled();
+    expect(service.statusExternal(caller, { request_id: stop.request_id })).toMatchObject({ receipt: { browser: 'unknown', processes: 'unknown' } });
+  });
 });
