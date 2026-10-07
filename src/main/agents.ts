@@ -27,7 +27,7 @@ import { connectorName } from '../shared/connector-names.js';
 import { getChatModels, refreshForUnoffered } from './chat-models.js';
 import { resolveChatModel, type ChatModelOption } from '../shared/chat-models.js';
 import { logInfo, logWarn } from './logger.js';
-import { inheritWorkspace, releasePrimeWorkspace, bindAgentWorkspace } from './workspace.js';
+import { inheritWorkspace, inheritExternalWorkspace, releasePrimeWorkspace, bindAgentWorkspace } from './workspace.js';
 import { requestCorrelation } from './session/correlation.js';
 import { getSession, findSessionByConversation } from './session/store.js';
 import { continuationForSession } from './session/continuation.js';
@@ -775,7 +775,12 @@ function chatCaller(caller: Caller): ChatGptCaller | undefined {
 }
 function requireExternalCaller(caller: ExternalCaller): void {
   if (!isExternalCallerAuthenticated(caller)) throw new ExternalPrimeError('ACCESS_REVOKED', 'External access unavailable');
-  if (externalLedgerCorrupt || quarantinedExternalLedgers.has(caller.principalId)) throw new ExternalPrimeError('PERSISTENCE_FAILED', 'External broker ledger needs local recovery or permanent disposal');
+  assertExternalPrincipalBrokerAccess(caller.principalId);
+}
+
+/** Shared internal admission; it grants no transport authentication or family ownership. */
+export function assertExternalPrincipalBrokerAccess(principalId: string): void {
+  if (externalLedgerCorrupt || quarantinedExternalLedgers.has(principalId)) throw new ExternalPrimeError('PERSISTENCE_FAILED', 'External broker ledger needs local recovery or permanent disposal');
 }
 
 type Family = Run | DormantRun;
@@ -922,6 +927,17 @@ function externalFamily(caller: ExternalCaller, familyId: FamilyId, includeUnpub
 export function workerFamilyOrigin(runId: string): { owner: AgentOwner; familyId: FamilyId } | null {
   const family = allFamilies().find(row => familyKey(row) === runId);
   return family ? { owner: { ...family.owner }, familyId: family.familyId } : null;
+}
+
+/** Internal detached placement projection; family addresses select state, never grant access. */
+export function externalWorkerPlacement(familyId: FamilyId): ExternalFamilyPlacement | null {
+  const family = allFamilies().find(row => row.familyId === familyId && row.owner.kind === 'external_principal' &&
+    !unpublishedRuns.has(row as Run));
+  return family?.externalPlacement ? structuredClone(family.externalPlacement) : null;
+}
+
+export function workerOwner(conversationId: string): AgentOwner | null {
+  return workerPrimeOwner(conversationId).owner ?? null;
 }
 
 export function resolveExternalFamily(caller: ExternalCaller, familyId: FamilyId): { familyId: FamilyId; runId: string; owner: AgentOwner; placement?: ExternalFamilyPlacement } {
@@ -2234,7 +2250,10 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
     // A worker starts in the folder the prime was working in, so its first call can use the
     // same shorthand. It is a copy: a worker sent into another project overwrites its own
     // entry and never the prime's.
-    inheritWorkspace(id, activeRun.primeConversationId, activeRun.runId, activeRun.primeRequestId);
+    if (activeRun.owner.kind === 'external_principal' && activeRun.externalPlacement) {
+      const root = getConfig().roots.find(row => row.name === activeRun.externalPlacement!.workspaceRootId);
+      if (root) inheritExternalWorkspace(id, root, activeRun.runId);
+    } else inheritWorkspace(id, activeRun.primeConversationId, activeRun.runId, activeRun.primeRequestId);
     createdAgents.push(agent);
     created.push({ ...agent.info });
   }
@@ -4613,7 +4632,7 @@ export interface WorkerPrimeOwner {
   externalPlacement?: ExternalFamilyPlacement;
   /** True only when this exact conversation is durably/presently owned by a worker slot. */
   owned: boolean;
-  /** Null for ambiguous/provisional ownership: strict authorization must fail closed. */
+  /** Null for external owners, or ambiguous/provisional GPT ownership; inspect owner.kind. */
   primeConversationId: string | null;
   /** Current family incarnation, useful for diagnostics only; never an authorization token. */
   runId: string | null;
@@ -4643,6 +4662,7 @@ export function workerPrimeOwner(conversationId: string): WorkerPrimeOwner {
     owned: true,
     owner: { ...owner.owner },
     familyId: owner.familyId,
+    externalPlacement: owner.externalPlacement ? structuredClone(owner.externalPlacement) : undefined,
     primeConversationId: owner.primeConversationId ?? null,
     runId: familyKey(owner),
     setupProfileId: owner.setupProfileId ?? null

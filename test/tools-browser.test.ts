@@ -17,7 +17,7 @@ vi.mock('../src/main/session/store.js',()=>({conversationAttachment:async()=>sta
 vi.mock('../src/main/session/correlation.js',()=>({requestCorrelation:(id:string)=>state.proofs.get(id) ?? null}));
 vi.mock('../src/main/session/blocked-chats.js',()=>({isChatBlocked:()=>state.blocked}));
 vi.mock('../src/main/session/continuation.js',()=>({compactingConversation:()=>false}));
-vi.mock('../src/main/agents.js',()=>({dormantWorkerNotice:()=>null,endedWorkerNotice:()=>null,retiredWorkerForConversation:()=>null}));
+vi.mock('../src/main/agents.js',()=>({workerPrimeOwner:()=>({owned:false,primeConversationId:null,runId:null}),dormantWorkerNotice:()=>null,endedWorkerNotice:()=>null,retiredWorkerForConversation:()=>null}));
 vi.mock('../src/main/codex/view-image.js',()=>({validateImageBytes:state.image}));
 import { registerBrowserTools } from '../src/main/mcp/tools-browser.js';
 

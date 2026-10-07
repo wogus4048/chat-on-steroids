@@ -160,6 +160,7 @@ import {
   type SurfaceRegistrar,
   type ToolResult
 } from './kernel.js';
+import { currentExternalWorkerRefusal } from './kernel.js';
 
 /** Entries one `read` of a directory returns before it says it stopped. */
 const MAX_DIR_ENTRIES = 200;
@@ -909,6 +910,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               );
             }
 
+            const externalRefusal = currentExternalWorkerRefusal('command');
+            if (externalRefusal) return fail(externalRefusal);
             const processId = unifiedExecManager.allocateProcessId();
             // Process ids are deliberately small/reusable, while chat ownership lives in a
             // separate registry. Clear any stale row at the allocation boundary so a recycled
@@ -1076,6 +1079,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           }
           // Both sides of the wait. An empty poll blocks for seconds by design, and a caller
           // sitting in one is attending its session rather than neglecting it.
+          const externalRefusal = currentExternalWorkerRefusal('command');
+          if (externalRefusal) return fail(externalRefusal);
           noteExecAttended(input.session_id);
           try {
             const output = await unifiedExecManager.writeStdin({
@@ -1862,6 +1867,12 @@ async function runParsedPatch(
     }
   }
 
+  const externalRefusal = currentExternalWorkerRefusal(caps === undefined ? 'command' : undefined);
+  if (externalRefusal) return { result: fail(externalRefusal), content: null, exitCode: null };
+  if (caps !== undefined) {
+    const denial = patchCapabilityDenial(effectiveArgs.hunks, caps);
+    if (denial) return { result: fail(denial), content: null, exitCode: null };
+  }
   const execution = await executeApplyPatch({
     patch: effectiveArgs.patch,
     cwd: effectiveBase.real,

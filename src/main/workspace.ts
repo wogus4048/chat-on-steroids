@@ -162,6 +162,14 @@ export function inheritWorkspace(toAgent: string, primeConversationId: string | 
   return true;
 }
 
+/** External family placement initializes the same staging map; it grants no filesystem access. */
+export function inheritExternalWorkspace(toAgent: string, root: Root, runId: string): boolean {
+  const key = stagedAgentKey(toAgent, runId);
+  if (!key) return false;
+  setWorkspaceFor(key, { virtual: `/${root.name}`, real: root.path });
+  return true;
+}
+
 /** The exact prime chat remains the owner before, during and after its run. */
 export function primeWorkspace(primeConversationId: string | null): Workspace | null {
   return workspaceForChat(primeConversationId);

@@ -1,3 +1,7 @@
+import { externalPlacementGrant } from './session/conversation-access.js';
+import { ExternalPrimeError } from './external-prime-auth.js';
+import { externalPlacementToolContext } from './mcp/kernel.js';
+import { resolvePath } from './sandbox.js';
 import { conversationProgress } from './session/progress.js';
 import { cosSignInTransfer, SignInTransferError } from './cos-browser/sign-in-transfer.js';
 import { externalBrowserProof, noteExternalInstalled, noteExternalSignedIn, resetBrowserProofForTests } from './browser-proof.js';
@@ -183,6 +187,7 @@ import { ownCoreHint,
   mutateSwarm,
   mutateAgentAuthority,
   workerFamilyOrigin,
+  externalWorkerPlacement,
   swarmState,
   swarmTransferActive,
   noteAgentAlive,
@@ -579,12 +584,13 @@ let commandReceipts: CommandReceipt[] = [];
  * use this same boundary so a worker cannot begin MCP work in a gap where attribution already
  * knows its conversation but the agent dispatcher still sees a stranger.
  */
-function bindLeasedWorkerCommand(agent: string | null, commandId: string | null, conversation: string): boolean {
+function bindLeasedWorkerCommand(agent: string | null, commandId: string | null, conversation: string, browser: string | null, host: 'extension' | 'cos' | null): boolean {
   if (!agent || !commandId) return false;
   const pending = commands.find(
     (command) =>
       command.id === commandId &&
       command.spec.type === 'worker' &&
+      commandMatchesCompanion(command.spec, browser, host) &&
       command.spec.agent === agent &&
       swarmRunning(command.spec.runId) &&
       command.claimedAt !== null
@@ -651,6 +657,25 @@ function browserOf(req: http.IncomingMessage): string | null {
   return typeof id === 'string' && /^[a-z0-9]{16,64}$/.test(id) ? id : null;
 }
 const browserSeenAt = new Map<string, number>();
+function companionHost(req: http.IncomingMessage): 'extension' | 'cos' | null {
+  return req.headers['x-extension-host'] === 'browser' ? 'extension' : req.headers['x-extension-host'] === 'cos' ? 'cos' : null;
+}
+
+/** Null is ordinary GPT placement; false is external placement without current authority. */
+function commandExternalPlacement(spec: CommandSpec) {
+  if (spec.type !== 'worker' && spec.type !== 'revive') return null;
+  const origin = workerFamilyOrigin(spec.runId);
+  if (origin?.owner.kind !== 'external_principal') return null;
+  const placement = externalWorkerPlacement(origin.familyId);
+  try { externalPlacementGrant(origin.owner.principalId, placement, getConfig().tunnel.profileId ?? 'default'); }
+  catch (error) { if (error instanceof ExternalPrimeError) return false; throw error; }
+  return placement;
+}
+
+function commandMatchesCompanion(spec: CommandSpec, browser: string | null, host: 'extension' | 'cos' | null): boolean {
+  const placement = commandExternalPlacement(spec);
+  return placement === null || !!placement && placement.browserBinding.browserId === browser && placement.browserBinding.kind === host;
+}
 /** How long a browser keeps a new chat it was handed after it stops polling. */
 const OPENING_CUSTODY_MS = 60_000;
 /** New-chat inputs and the one browser each was first handed to. */
@@ -2418,7 +2443,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const repairHeld = url.searchParams.get('repairHeld');
     if (repairHeld) noteRepairHeld(repairHeld.slice(0, 64), url.searchParams.get('why'));
-    const revivals = pendingBrowserRevivals();
+    const revivals = pendingBrowserRevivals().filter(row => {
+      const command = commands.find(entry => entry.id === row.id);
+      return command && commandMatchesCompanion(command.spec, browserOf(req), companionHost(req));
+    });
     const revival = revivals[0] ?? null;
     const inputRows = await listInputs();
     const browser = browserOf(req);
@@ -2457,7 +2485,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         commandIds: commands.map(command => command.id),
         revival,
         revivals,
-        placement: pendingBrowserPlacement(null, browser),
+        placement: pendingBrowserPlacement(null, browser, companionHost(req)),
         ...(canReveal ? { reveals: takeReveals(browser) } : {}),
         ...(req.method === 'POST' && imageExportRequested ? { imageExports: pendingImageExports() } : {}),
         // A failure report closes this request. Reissuing the repair in the same response would
@@ -2636,7 +2664,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       ? body['agent']
       : null;
     const reportedCommandId = typeof body['agentCommandId'] === 'string' ? body['agentCommandId'] : null;
-    bindLeasedWorkerCommand(reportedAgent, reportedCommandId, id);
+    bindLeasedWorkerCommand(reportedAgent, reportedCommandId, id, browserOf(req), companionHost(req));
 
     // This is the live-turn ownership handshake, deliberately separate from transcript
     // delivery. A fresh ChatGPT conversation can expose metadata.request_id before its
@@ -2701,7 +2729,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       ? body['agent']
       : null;
     const reportedCommandId = typeof body['agentCommandId'] === 'string' ? body['agentCommandId'] : null;
-    bindLeasedWorkerCommand(reportedAgent, reportedCommandId, id);
+    bindLeasedWorkerCommand(reportedAgent, reportedCommandId, id, browserOf(req), companionHost(req));
     // This reports attachment only. The recorder below owns actual work and replay deduplication.
     const revived = await mutateSwarm(() => noteAgentAlive(id, 'page'));
     if (revived?.report) await recordAgentMessage(revived.report, 'sent', id);
@@ -4263,6 +4291,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // does nothing, which is the point: a stale marker must never type anything.
       return json(res, 404, { error: 'no_such_command' }, origin);
     }
+    if (!commandMatchesCompanion(command.spec, browserOf(req), companionHost(req)))
+      return json(res, 409, { error: 'external_browser_binding_mismatch' }, origin);
     if (command.spec.type === 'stop') {
       if (!client || Date.now() - command.createdAt >= STOP_COMMAND_TIMEOUT_MS || reportedConversation !== command.spec.conversationId || !await stopCommandCurrent(command.spec))
         return json(res, 409, { error: 'stop_turn_changed' }, origin);
@@ -4374,9 +4404,24 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const sourceConversation = primeConversation(command.spec.runId);
       const source = sourceConversation ? await findSessionByConversation(sourceConversation, { requireUnique: true }) : null;
       const sessionId = source?.conversationId === sourceConversation ? source?.id : undefined;
-      described.text = await prepareSessionPrompt(described.text, { sessionId });
+      const external = commandExternalPlacement(command.spec);
+      const provenance = workerFamilyOrigin(command.spec.runId);
+      if (external && provenance?.owner.kind === 'external_principal') {
+        const principalId = provenance.owner.principalId;
+        const toolContext = () => externalPlacementToolContext(principalId, external, { roots: getConfig().roots,
+          caps: effectiveCapabilities(getConfig()), readOnly: getConfig().readOnly, setupProfileId: getConfig().tunnel.profileId ?? 'default' });
+        const workspace = async () => {
+          const resolved = await resolvePath(toolContext().roots, `/${external.workspaceRootId}`);
+          toolContext();
+          return resolved;
+        };
+        described.text = await prepareSessionPrompt(described.text, { workspace, toolContext });
+      } else if (external === false) return json(res, 409, { error: 'external_access_revoked' }, origin);
+      else described.text = await prepareSessionPrompt(described.text, { sessionId });
     }
     if (!commands.includes(command) || command.owner !== client) return json(res, 409, { error: 'command_taken' }, origin);
+    if (!commandMatchesCompanion(command.spec, browserOf(req), companionHost(req)))
+      return json(res, 409, { error: 'external_browser_binding_mismatch' }, origin);
     const liveResume = command.spec.type === 'resume' ? continuationByToken(command.spec.token) : null;
     if (command.spec.type === 'resume' && (!liveResume || !sendUnattempted(liveResume.destinationSend)))
       return json(res, 409, { error: 'command_already_sent', final: true }, origin);
@@ -4399,7 +4444,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const command = commands.find(entry => entry.id === body['id']);
     // A wake reports its wait before it redeems, so it has no owner yet; every later step needs one.
     const allowed = step && REVIVAL_WAIT_STEPS.has(step) ? command?.owner === null : command?.owner != null && command.owner === body['client'];
-    if (!step || !command || !allowed) return json(res, 200, { ok: false }, origin);
+    if (!step || !command || !allowed || !commandMatchesCompanion(command.spec, browserOf(req), companionHost(req))) return json(res, 200, { ok: false }, origin);
     command.progress = { ...command.progress, step, stepAt: Date.now() };
     if (command.spec.type === 'resume' && command.timer && continuationByToken(command.spec.token)?.automatic) armDeadline(command);
     return json(res, 200, { ok: true }, origin);
@@ -4437,6 +4482,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 200, receiptReply(priorReceipt), origin);
     }
     const ownedCommand = commands.find((command) => command.id === id) ?? null;
+    if (ownedCommand && !commandMatchesCompanion(ownedCommand.spec, browserOf(req), companionHost(req)))
+      return json(res, 409, { error: 'external_browser_binding_mismatch' }, origin);
     // Every current page echoes its per-document client. If its command has already expired,
     // been cancelled or been superseded, accepting the late ACK as success strands a real
     // tab whose model can never be bound to the worker/session it was opened for. Legacy
@@ -4494,6 +4541,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!command || command !== ownedCommand) {
       return json(res, 404, { error: 'no_such_command' }, origin);
     }
+    if (!commandMatchesCompanion(command.spec, browserOf(req), companionHost(req)))
+      return json(res, 409, { error: 'external_browser_binding_mismatch' }, origin);
     if (command.spec.type === 'stop') return json(res, 409, { error: 'command_identity_changed' }, origin);
     if (client && command.owner !== client) {
       return json(res, 409, { error: 'command_owner_changed' }, origin);
@@ -6389,6 +6438,13 @@ async function captureRecordedBrief(
  * not necessarily the one chat A is in.
  */
 function offerPlacement(command: Command): boolean {
+  const external = commandExternalPlacement(command.spec);
+  if (external !== null) {
+    if (!external) return false;
+    command.placement = { conversationId: null, background: getConfig().ui.backgroundChats === true };
+    wakeBrowserWork();
+    return true;
+  }
   const home = commandHomeConversation(command.spec);
   const worker = command.spec.type === 'worker' && browserWakeConnected();
   const held = command.spec.type === 'resume' && home !== null && chatHolders(home).length > 0;
@@ -6403,11 +6459,11 @@ function offerPlacement(command: Command): boolean {
  * collects the placement for its own chat; a browser's maintenance pass collects a worker's, and
  * a replacement's only while that browser holds the replacement's source chat.
  */
-function pendingBrowserPlacement(conversationId: string | null, browser: string | null = null): {
+function pendingBrowserPlacement(conversationId: string | null, browser: string | null = null, host: 'extension' | 'cos' | null = null): {
   id: string; model: string | null; reasoningEffort: ReasoningEffort | null;
   background?: true; active: boolean; homeConversationId: string | null; project: string | null;
 } | null {
-  const command = commands.find(entry => entry.owner === null && entry.placement &&
+  const command = commands.find(entry => entry.owner === null && entry.placement && commandMatchesCompanion(entry.spec, browser, host) &&
     (entry.placement.conversationId === conversationId || (conversationId === null && (entry.spec.type === 'worker' ||
       (entry.spec.type === 'resume' && browser !== null && entry.placement.conversationId !== null &&
         chatHolders(entry.placement.conversationId).includes(browser))))));
@@ -9506,6 +9562,18 @@ async function deliverOne(): Promise<void> {
   tidyCommands();
   const command = nextDeliverable();
   if (!command) return;
+  const external = commandExternalPlacement(command.spec);
+  if (external !== null) {
+    if (!external) { drop(command, 'ACCESS_REVOKED: external placement is no longer allowed'); return; }
+    // An offline binding retains this bounded bootstrap ticket. It never elects another browser
+    // or asks the OS opener to choose a profile. Only its exact companion may collect placement.
+    if (!(await persistCommandLease(command, null, Date.now()))) return;
+    armDeadline(command);
+    offerPlacement(command);
+    changed();
+    scheduleDeliver();
+    return;
+  }
   if (!openInBrowser) {
     // Nothing can open a browser in this process, and nothing will come and ask. Ending it
     // here is what keeps the failure honest: the continuation stays in the chat it is in and
@@ -9570,6 +9638,7 @@ const PLACEMENT_FALLBACK_MS = 60_000;
  * proof a page took it, and the lookup by id is what makes a stale timer harmless.
  */
 function armPlacementFallback(command: Command): void {
+  if (commandExternalPlacement(command.spec) !== null) return;
   const timer = setTimeout(() => {
     const current = commands.find((entry) => entry.id === command.id);
     if (!current || current.owner !== null) return;
@@ -9607,6 +9676,7 @@ function commandProject(command: Command): string | null {
 }
 
 async function openFreshChatInBrowser(command: Command): Promise<void> {
+  if (commandExternalPlacement(command.spec) !== null) return;
   if (!openInBrowser) {
     drop(command, 'this app has no way to open a browser window');
     return;

@@ -29,6 +29,7 @@ import {
   bindAgentWorkspace,
   currentWorkspace,
   inheritWorkspace,
+  inheritExternalWorkspace,
   moveChatWorkspace,
   parkAgentWorkspace,
   primeWorkspace,
@@ -453,4 +454,13 @@ describe('the sandbox is still the boundary', () => {
       SandboxError
     );
   });
+});
+
+it('binds external staged cwd to its exact worker without replacing a GPT workspace', () => {
+  const root = roots[0]!;
+  setWorkspaceFor('chat:gpt-prime', { virtual: '/work/gpt', real: path.join(root.path, 'gpt') });
+  expect(inheritExternalWorkspace('worker-1', root, 'external-run')).toBe(true);
+  expect(bindAgentWorkspace('worker-1', 'external-worker', 'external-run')).toBe(true);
+  expect(workspaceForChat('external-worker')).toMatchObject({ virtual: `/${root.name}`, real: root.path });
+  expect(workspaceForChat('gpt-prime')).toMatchObject({ virtual: '/work/gpt' });
 });

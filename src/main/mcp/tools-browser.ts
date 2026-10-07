@@ -1,6 +1,7 @@
 /** Compact browser tools, carried by Desktop and the same invocation/recording kernel. */
 import { z } from 'zod';
 import { browserControl } from '../browser-control.js';
+import { externalWorkerGrant } from '../session/conversation-access.js';
 import { browserToolWrites, BROWSER_LIMITS, type BrowserTool } from '../../shared/browser-control.js';
 import { effectiveCapabilities, getConfig } from '../config.js';
 import { currentCall } from './call-context.js';
@@ -90,6 +91,14 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
         const owner = exact?.sessionId ? `session:${exact.sessionId}` : getConfig().multiAgent.allowUnattributedCalls
           ? caller?.requestId ? `request:${caller.requestId}` : 'unattributed' : null;
         if (!owner) return failIdentity('BROWSER_IDENTITY_REQUIRED: exact local session or Allow unattributed calls is required. No browser operation ran.');
+        const originalExternal = externalWorkerGrant(exact?.conversationId ?? caller?.conversationId);
+        const sameExternalAuthority = (chat: string): boolean => {
+          const current = externalWorkerGrant(chat);
+          if (!originalExternal) return current === null;
+          return !!current && current.worker.familyId === originalExternal.worker.familyId &&
+            current.worker.runId === originalExternal.worker.runId && current.principal.principalId === originalExternal.principal.principalId &&
+            current.principal.capabilities.includes(capability);
+        };
         const allowed = async () => {
           const config = getConfig();
           if (!effectiveCapabilities(config)[capability]) return false;
@@ -98,8 +107,9 @@ export function registerBrowserTools(reg: SurfaceRegistrar): void {
           if (!identity?.sessionId) return config.multiAgent.allowUnattributedCalls;
           const chat = identity.conversationId;
           if (!chat) return false;
+          if (!sameExternalAuthority(chat)) return false;
           const attached = await conversationAttachment(chat, identity.sessionId);
-          return attached === 'current' && !isChatBlocked(chat) && !compactingConversation(chat) &&
+          return attached === 'current' && sameExternalAuthority(chat) && !isChatBlocked(chat) && !compactingConversation(chat) &&
             !retiredWorkerForConversation(chat) && !dormantWorkerNotice(chat) && !endedWorkerNotice(chat) && effectiveCapabilities(getConfig())[capability];
         };
         const result = await browserControl.execute(tool, args, owner, exact?.conversationId ?? caller?.conversationId ?? null, allowed);

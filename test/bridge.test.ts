@@ -15155,3 +15155,59 @@ describe('worker brief on a computer with its own connector names', () => {
     } finally { await saveConfig(previous); }
   });
 });
+
+describe('external worker exact browser placement', () => {
+  async function externalSpawn() {
+    const { createExternalPrincipal, authenticateExternal } = await import('../src/main/external-prime-auth.js');
+    await saveConfig({ ...getConfig(), roots: [{ name: 'trial', path: dir }], externalPrime: { enabled: true, principals: [] } });
+    const binding = { kind: 'extension' as const, browserId: 'externaltestbrowser123456' };
+    const created = await createExternalPrincipal({ label: 'trial', rootIds: ['trial'], capabilities: ['read'], browserBinding: binding, setupProfileId: 'default' });
+    await (await import('node:fs/promises')).writeFile(dir + '/AGENTS.md', 'EXTERNAL_ROOT_INSTRUCTIONS');
+    const broker = await import('../src/main/agents.js');
+    const accepted = await broker.acceptStagedSwarmMutation(() => broker.stageSpawn({ caller: authenticateExternal(created.token), externalPlacement: { workspaceRootId: 'trial', browserBinding: binding, setupProfileId: 'default' }, workers: [{ task: 'exact browser task' }] }));
+    // An earlier restoration fixture disposes the singleton replay listener. Exercise its
+    // actual bridge owner directly rather than relying on another test's listener lifetime.
+    const { queueWorkerBootstrap } = await import('../src/main/bridge.js');
+    queueWorkerBootstrap('worker-1', 'exact browser task', null, null, accepted.runId);
+    return binding;
+  }
+  it('never uses the OS opener or a different browser when the bound browser is offline', async () => {
+    await pair();
+    await externalSpawn();
+    await vi.waitFor(async () => expect((await readDurable<any>('bridge-commands'))?.commands?.[0]?.phase).toBe('leased'));
+    const other = await request('POST', '/status', { browser: 'otherbrowser123456', host: 'browser', body: { openConversations: [] } });
+    expect(other.body.placement).toBeNull();
+    expect(opened).toHaveLength(0);
+  });
+  it('offers and redeems only in the bound companion identity and host', async () => {
+    await pair();
+    const binding = await externalSpawn();
+    await vi.waitFor(async () => expect((await readDurable<any>('bridge-commands'))?.commands?.[0]?.phase).toBe('leased'));
+    const wrongHost = await request('POST', '/status', { browser: binding.browserId, host: 'cos', body: { openConversations: [] } });
+    expect(wrongHost.body.placement).toBeNull();
+    const placement = await request('POST', '/status', { browser: binding.browserId, host: 'browser', body: { openConversations: [] } });
+    expect(placement.body.placement?.id).toBeTruthy();
+    const id = placement.body.placement.id;
+    const wrong = await request('POST', '/commands/redeem', { browser: 'otherbrowser123456', host: 'browser', body: { id, client: 'wrong' } });
+    expect(wrong.status).toBe(409);
+    const right = await request('POST', '/commands/redeem', { browser: binding.browserId, host: 'browser', body: { id, client: 'right' } });
+    expect(right.status).toBe(200);
+    expect(right.body.command.text).toContain('EXTERNAL_ROOT_INSTRUCTIONS');
+    expect(right.body.command.text).toContain('/trial');
+    expect(opened).toHaveLength(0);
+  });
+  it('does not let lost-ACK events bind a worker through another companion', async () => {
+    await pair();
+    const binding = await externalSpawn();
+    await vi.waitFor(async () => expect((await readDurable<any>('bridge-commands'))?.commands?.[0]?.phase).toBe('leased'));
+    const id = pendingCommands()[0]!.id;
+    const conversationId = 'aaaabbbb-1111-4111-8111-123456789012';
+    const body = { conversationId, agent: 'worker-1', agentCommandId: id, events: [] };
+    await request('POST', '/events', { browser: 'otherbrowser123456', host: 'browser', body });
+    const broker = await import('../src/main/agents.js');
+    expect(broker.workerPrimeOwner(conversationId).owned).toBe(false);
+    await request('POST', '/events', { browser: binding.browserId, host: 'browser', body });
+    expect(broker.workerPrimeOwner(conversationId).owner?.kind).toBe('external_principal');
+  });
+
+});

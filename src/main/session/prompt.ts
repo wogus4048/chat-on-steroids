@@ -1,35 +1,56 @@
 import path from 'node:path';
 import { readFileStream } from '../codex/filesystem.js';
 import { effectiveCapabilities, getConfig } from '../config.js';
+import type { ToolContext } from '../mcp/kernel.js';
+import { serverInstructions } from '../mcp/instructions.js';
+import { skillLibraryInstructions } from '../skill-library.js';
 import { currentCoreInstructions } from '../mcp/instructions.js';
 import { getSessionProject, projectWorkspace } from '../projects.js';
 import { resolvePath } from '../sandbox.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt } from '../../shared/user-prompt.js';
 import { selectedSkillInstructions, type SelectedSkill } from './skill-prompt.js';
 import { listSkillLibrary } from '../skill-library.js';
+import { skillCatalogSnapshot, skillsDirectory } from '../skills.js';
+import type { SkillLibrary } from '../../shared/skills.js';
 import type { RoutedSkillSelection } from '../../shared/skill-routing.js';
 
-type PromptScope = { sessionId?: string | null; projectId?: string | null; autoSkills?: readonly RoutedSkillSelection[] };
+type PromptScope = { sessionId?: string | null; projectId?: string | null; autoSkills?: readonly RoutedSkillSelection[]; workspace?: () => Promise<{ virtual: string; real: string } | null>; toolContext?: () => ToolContext };
 export type PromptLimits = { maxChars: number; maxBytes: number };
 type ProjectInstructions = { directory: string; text: string; truncated: boolean };
 const limits: PromptLimits = { maxChars: MAX_CHATGPT_MESSAGE_CHARS, maxBytes: Infinity };
 const cutNotice = '\n\n[Cut off because of the message limit. Read AGENTS.md yourself for the remaining instructions.]';
 
 const promptFolder = (scope: PromptScope) => scope.sessionId ? getSessionProject(scope.sessionId)
-  : scope.projectId ? projectWorkspace(scope.projectId) : Promise.resolve(null);
+  : scope.workspace ? scope.workspace() : scope.projectId ? projectWorkspace(scope.projectId) : Promise.resolve(null);
+const promptRoots = (scope: PromptScope) => scope.toolContext?.().roots ?? getConfig().roots;
+const promptCaps = (scope: PromptScope) => scope.toolContext?.().caps ?? effectiveCapabilities(getConfig());
+
+/** External preparation never discovers global files. Cached candidates still prove their path. */
+async function scopedSkillLibrary(scope: PromptScope): Promise<SkillLibrary> {
+  const library: SkillLibrary = { skills: [], roots: [], errors: [], includeInstructions: true };
+  const directory = skillsDirectory();
+  if (!directory || !promptCaps(scope).read) return library;
+  for (const summary of skillCatalogSnapshot()) {
+    try {
+      const resolved = await resolvePath(promptRoots(scope), path.join(directory, summary.id, 'SKILL.md'));
+      if (!promptCaps(scope).read) throw new Error('Read permission changed during Skill preparation');
+      library.skills.push({ ...summary, path: resolved.virtual, scope: 'managed', source: 'managed', managed: true, allowImplicitInvocation: false });
+    } catch { /* A catalog item outside this grant is not a candidate or an authority source. */ }
+  }
+  return library;
+}
 
 /** One selected folder, never cwd inference, global discovery or a recursive document scan. */
 async function projectInstructions(scope: PromptScope): Promise<ProjectInstructions | null> {
-  if (!scope.sessionId && !scope.projectId) return null;
+  if (!scope.sessionId && !scope.projectId && !scope.workspace) return null;
   // Existing sessions own their project; a caller-provided project cannot replace that binding.
-  const folder = scope.sessionId ? await getSessionProject(scope.sessionId)
-    : await projectWorkspace(scope.projectId!);
+  const folder = await promptFolder(scope);
   if (!folder) return null;
   const directoryOnly = { directory: folder.virtual, text: '', truncated: false };
-  if (!effectiveCapabilities(getConfig()).read) return directoryOnly;
+  if (!promptCaps(scope).read) return directoryOnly;
   const filename = path.join(folder.real, 'AGENTS.md');
   try {
-    const resolved = await resolvePath(getConfig().roots, filename, { allowMissing: true });
+    const resolved = await resolvePath(promptRoots(scope), filename, { allowMissing: true });
     // At most four UTF-8 bytes per available UTF-16 code unit, plus one byte to detect overflow.
     // Stream a bounded prefix so even a gigabyte AGENTS.md never becomes a gigabyte allocation.
     const budget = MAX_CHATGPT_MESSAGE_CHARS * 4;
@@ -46,14 +67,14 @@ async function projectInstructions(scope: PromptScope): Promise<ProjectInstructi
     const text = new TextDecoder('utf-8', { fatal: true }).decode(data.subarray(0, budget), { stream: bytes > budget });
     if (text.includes('\0')) throw new Error('AGENTS.md must be a UTF-8 text file');
     // Permission/path changes during the asynchronous read cannot publish another folder's text.
-    const current = scope.sessionId ? await getSessionProject(scope.sessionId) : await projectWorkspace(scope.projectId!);
-    const checked = await resolvePath(getConfig().roots, filename);
-    if (!current || current.real !== folder.real || checked.real !== resolved.real || !effectiveCapabilities(getConfig()).read)
+    const current = await promptFolder(scope);
+    const checked = await resolvePath(promptRoots(scope), filename);
+    if (!current || current.real !== folder.real || checked.real !== resolved.real || !promptCaps(scope).read)
       throw new Error('Project instructions changed location or permission while being read');
     return { directory: current.virtual, text: text.trim() ? text : '', truncated: bytes > budget };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      const current = scope.sessionId ? await getSessionProject(scope.sessionId) : await projectWorkspace(scope.projectId!);
+      const current = await promptFolder(scope);
       if (current?.real === folder.real) return { ...directoryOnly, directory: current.virtual };
     }
     // Do not expose native filesystem paths through the browser bridge's error response.
@@ -118,9 +139,11 @@ export async function prepareSessionPrompt(text: string, scope: PromptScope = {}
   // Automatic routing has already frozen its decision from the app's published Skill catalog at
   // admission, so those Skills come from that catalog: only the selected body is read below. Every
   // other Skill the chat can use is still listed, exactly as without routing.
-  const library = await listSkillLibrary(scope.autoSkills !== undefined ? { ...skillScope, managedFromCatalog: true } : skillScope);
-  const core = await currentCoreInstructions(library);
-  const skills = await selectedSkillInstructions(authored, skillScope, library, scope.autoSkills);
+  const library = scope.toolContext ? await scopedSkillLibrary(scope) :
+    await listSkillLibrary(scope.autoSkills !== undefined ? { ...skillScope, managedFromCatalog: true } : skillScope);
+  const core = scope.toolContext ? serverInstructions(scope.toolContext(), 'core', process.platform, skillLibraryInstructions(library)) : await currentCoreInstructions(library);
+  const skills = await selectedSkillInstructions(authored, skillScope, library, scope.autoSkills,
+    scope.toolContext ? () => ({ roots: promptRoots(scope), read: promptCaps(scope).read }) : undefined);
   fitSessionPrompt(text, core, null, budget); // Only Core/task overflow is mandatory.
   const agents = await projectInstructions(scope);
   if ((await promptFolder(scope))?.real !== folder?.real) throw new Error('The selected project changed during Skill preparation');

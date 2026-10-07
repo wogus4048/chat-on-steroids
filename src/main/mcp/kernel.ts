@@ -105,7 +105,7 @@ import {
 import { requestCorrelation } from '../session/correlation.js';
 import { summarizeRunningCall } from '../session/summarize.js';
 import { anyChatBlocked, BLOCKED_CHAT_REFUSAL, isChatBlocked } from '../session/blocked-chats.js';
-import { STRICT_CHAT_REFUSAL, conversationAccessRefusal, strictChatAllowlistEnabled } from '../session/conversation-access.js';
+import { STRICT_CHAT_REFUSAL, conversationAccessRefusal, strictChatAllowlistEnabled, externalWorkerGrant, externalWorkerAccessRefusal, externalPlacementGrant, externalWorkerOriginRefusal } from '../session/conversation-access.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import {
   acknowledgeBackgroundExecOutput,
@@ -128,6 +128,54 @@ import type { ToolOutcome } from '../../shared/session.js';
 /** The page's exact proof of a request id, by which a running call counts for its chat. */
 const requestOwner = (requestId: string): string | null => requestCorrelation(requestId)?.conversationId ?? null;
 
+/** Synchronous fresh projection at each accessor: no shared context or mirrored grants. */
+function externalContext(conversationId: string | null | undefined, base: ToolContext): ToolContext {
+  const grant = externalWorkerGrant(conversationId);
+  if (!grant) return base;
+  return projectExternalContext(grant.principal, base);
+}
+
+function projectExternalContext(principal: import('../../shared/external-prime.js').ExternalPrincipal, base: ToolContext): ToolContext {
+  const config = getConfig();
+  const caps = { ...base.caps };
+  for (const cap of Object.keys(caps) as Array<keyof Capabilities>) {
+    caps[cap] = caps[cap] && config.capabilities[cap] && principal.capabilities.includes(cap) &&
+      !((base.readOnly || config.readOnly) && WRITE_CAPABILITIES.includes(cap));
+  }
+  const roots = base.roots.filter(root => principal.rootIds.includes(root.name) &&
+    config.roots.some(current => current.name === root.name && current.path === root.path));
+  return { ...base, roots, caps, readOnly: base.readOnly || config.readOnly };
+}
+
+/** Internal prompt preparation uses proven broker provenance, never transport impersonation. */
+export function externalPlacementToolContext(principalId: string, placement: import('../agents.js').ExternalFamilyPlacement, base: ToolContext): ToolContext {
+  return projectExternalContext(externalPlacementGrant(principalId, placement, base.setupProfileId), base);
+}
+
+export async function effectiveExternalWorkerContext(conversationId: string, base: ToolContext): Promise<ToolContext> {
+  return externalContext(conversationId, base);
+}
+
+/** Recheck after handler awaits before a process launch/input or other irreversible boundary. */
+export function currentExternalWorkerRefusal(capability?: keyof Capabilities): string | null {
+  const conversationId = currentCall()?.caller.conversationId;
+  if (isChatBlocked(conversationId)) return BLOCKED_CHAT_REFUSAL;
+  const refusal = externalWorkerAccessRefusal(conversationId);
+  if (refusal) return refusal;
+  const grant = externalWorkerGrant(conversationId);
+  if (grant && capability && (!grant.principal.capabilities.includes(capability) || !getConfig().capabilities[capability] ||
+      (getConfig().readOnly && WRITE_CAPABILITIES.includes(capability)))) return `TOOL_DISABLED: external worker lacks ${capability} permission.`;
+  return null;
+}
+
+function conversationAdmissionRefusal(conversationId: string | null | undefined, surface: SurfaceId): string | null {
+  if (isChatBlocked(conversationId)) return BLOCKED_CHAT_REFUSAL;
+  const refusal = externalWorkerAccessRefusal(conversationId);
+  if (refusal) return refusal;
+  if (surface === 'plugins' && externalWorkerGrant(conversationId)) return 'ACCESS_REVOKED: external worker plugin grants are not supported.';
+  return null;
+}
+
 const UNTRUSTED_NOTICE =
   'A tool call from an untrusted chat was refused. In the chat list, hover this chat in the sidebar and choose Trust (✓) to allow it.';
 const UNTRUSTED_WORKER_NOTICE =
@@ -141,6 +189,8 @@ const WORKER_CONNECTION_PROFILE_REFUSAL =
 
 function workerConnectionProfileRefusal(caller: CallCaller): string | null {
   const owner = caller.conversationId ? workerPrimeOwner(caller.conversationId) : null;
+  if (owner?.owner?.kind === 'external_principal' && caller.setupProfileId !== owner.setupProfileId)
+    return WORKER_CONNECTION_PROFILE_REFUSAL;
   return owner?.owned && owner.setupProfileId && caller.setupProfileId &&
     owner.setupProfileId !== caller.setupProfileId ? WORKER_CONNECTION_PROFILE_REFUSAL : null;
 }
@@ -802,7 +852,8 @@ async function dispatchTracked(
   // must not revive its worker or consume/receive input owned by the other connection.
   const conversationPolicyRefusal = (strictChatAllowlistEnabled()
     ? await conversationAccessRefusal(context.caller.conversationId)
-    : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
+    : conversationAdmissionRefusal(context.caller.conversationId, surface)) ??
+    conversationAdmissionRefusal(context.caller.conversationId, surface) ??
     workerConnectionProfileRefusal(context.caller);
   let silentFinishAuthorized = false;
   // Two things about liveness, both before the agent is resolved so that the answer this
@@ -941,7 +992,8 @@ async function dispatchTracked(
   // Permission can change while the liveness/recovery bookkeeping above awaits disk or browser
   // evidence. A prior refusal is monotonic, while a new revoke must take effect before any
   // background result is acknowledged or the requested handler is entered.
-  let preAckPolicyRefusal = conversationPolicyRefusal;
+  let preAckPolicyRefusal = conversationPolicyRefusal ?? externalWorkerOriginRefusal(context.caller.conversationId, callerSession?.origin) ??
+    conversationAdmissionRefusal(context.caller.conversationId, surface);
   if (!preAckPolicyRefusal && strictChatAllowlistEnabled()) {
     preAckPolicyRefusal = await conversationAccessRefusal(context.caller.conversationId);
   }
@@ -951,7 +1003,7 @@ async function dispatchTracked(
     const principal = executionPrincipal(requestId, context.caller.sessionId, allowUnattributed);
     await acknowledgeBackgroundExecOutput(principal, startedAt, explicitPoll);
   }
-  let admissionRefusal = preAckPolicyRefusal;
+  let admissionRefusal = preAckPolicyRefusal ?? conversationAdmissionRefusal(context.caller.conversationId, surface);
   if (!admissionRefusal && strictChatAllowlistEnabled()) {
     admissionRefusal = await conversationAccessRefusal(context.caller.conversationId);
   }
@@ -961,6 +1013,7 @@ async function dispatchTracked(
     if (strictChatAllowlistEnabled()) {
       admissionRefusal = await conversationAccessRefusal(context.caller.conversationId);
     }
+    admissionRefusal ??= conversationAdmissionRefusal(context.caller.conversationId, surface);
     if (!admissionRefusal) clearUntrustedRefusalEpisode(context);
   }
   if (admissionRefusal === STRICT_CHAT_REFUSAL) await recordUntrustedRefusalNotice(context);
@@ -1029,7 +1082,8 @@ async function dispatchTracked(
   });
   const deliveryPolicyRefusal = (strictChatAllowlistEnabled()
     ? await conversationAccessRefusal(context.caller.conversationId)
-    : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
+    : conversationAdmissionRefusal(context.caller.conversationId, surface)) ??
+    conversationAdmissionRefusal(context.caller.conversationId, surface) ??
     workerConnectionProfileRefusal(context.caller);
   const deliveryFenced = Boolean(conversationPolicyRefusal) || compacting || supersededConversation || Boolean(silentCeilingWorker) ||
     Boolean(deliveryPolicyRefusal) ||
@@ -1239,6 +1293,20 @@ async function validatedWorkspace() {
 
 /** The workspace, plus the virtual path of a learned one just dropped because its folder is gone. */
 async function liveWorkspace(): Promise<{ workspace: { virtual: string; real: string } | null; missing: string | null }> {
+  const conversationId = currentCall()?.caller.conversationId;
+  const grant = externalWorkerGrant(conversationId);
+  if (grant) {
+    const held = currentWorkspace();
+    if (held) return { workspace: held, missing: null };
+    const root = getConfig().roots.find(row => row.name === grant.worker.externalPlacement!.workspaceRootId)!;
+    const workspace = await resolvePath([root], `/${root.name}`);
+    const current = externalWorkerGrant(conversationId);
+    if (!current || current.worker.familyId !== grant.worker.familyId || current.principal.policyRevision !== grant.principal.policyRevision) {
+      throw new SandboxError('ACCESS_REVOKED: external worker authority changed while resolving its workspace.');
+    }
+    setCurrentWorkspace(workspace);
+    return { workspace, missing: null };
+  }
   const sessionId = currentCall()?.caller.sessionId;
   // Explicit project bindings are durable authority, even after a cwd was learned.
   // Validate first so a revoked or moved project never becomes a first-root fallback.
@@ -1262,8 +1330,10 @@ export async function resolveIn(
   requested: string,
   options: { allowMissing?: boolean; base?: string | null; access?: 'read' } = {}
 ): Promise<Resolved> {
+  const external = externalWorkerGrant(currentCall()?.caller.conversationId);
   // The user's own Skill folders are served only to read tools, and never become a workspace.
   if (isUserSkillVirtualPath(requested)) {
+    if (external) throw new SandboxError('ACCESS_REVOKED: this Skill folder is outside the external worker approved roots.');
     if (options.access !== 'read') throw new SandboxError(`${requested} is a read-only Skill folder. Copy the Skill into an approved folder to change it.`);
     return (await resolveUserSkillPath(requested))!;
   }
@@ -1274,13 +1344,17 @@ export async function resolveIn(
   // workspace: `posix.normalize('/root/a/../../elsewhere')` is a perfectly clean-looking
   // `/elsewhere`, and nothing downstream can tell it apart from a path that was always that.
   const workspace = await validatedWorkspace();
+  const grant = externalWorkerGrant(currentCall()?.caller.conversationId);
+  if (grant) roots = roots.filter(root => grant.principal.rootIds.includes(root.name) &&
+    getConfig().roots.some(current => current.name === root.name && current.path === root.path));
   const base = options.base !== undefined ? options.base : (workspace?.virtual ?? null);
   const resolveOptions = {
     ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
     base
   };
-  const resolved = await resolveLinkedSkillAlias(roots, requested, resolveOptions) ??
-    await resolvePath(roots, requested, resolveOptions);
+  const resolved = external ? await resolvePath(roots, requested, resolveOptions) :
+    await resolveLinkedSkillAlias(roots, requested, resolveOptions) ?? await resolvePath(roots, requested, resolveOptions);
+  externalWorkerGrant(currentCall()?.caller.conversationId);
   // Absolute only: a workspace learned from a relative path would let one loose resolution
   // decide where the next loose resolution points. See workspace.ts.
   if (isAbsoluteVirtualPath(requested) || isNativeWindowsPath(requested)) await learnWorkspace(resolved);
@@ -1400,6 +1474,13 @@ export interface SurfaceRegistrar {
 }
 
 export function createRegistrar(server: McpServer | null, ctx: ToolContext, surface: SurfaceId, observe?: (name: string, config: { description: string; inputSchema: z.ZodType; annotations?: ToolAnnotations }) => void): SurfaceRegistrar {
+  const base = ctx;
+  const effective = () => externalContext(currentCall()?.caller.conversationId, base);
+  // Existing handlers capture ctx/caps once. Accessors read the ALS caller whenever they spend
+  // authority, so concurrent families never rewrite one endpoint's shared permission object.
+  const capabilityView = new Proxy(base.caps, { get: (_target, key: string) => effective().caps[key as keyof Capabilities] });
+  ctx = new Proxy(base, { get: (target, key: keyof ToolContext) => key === 'caps' ? capabilityView :
+    key === 'roots' || key === 'readOnly' ? effective()[key] : target[key] });
   const caps = ctx.caps;
   const exposedCaps = ctx.exposedCaps ?? caps;
   // These two do not follow a capability checkbox: they are whole features the user
