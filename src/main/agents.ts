@@ -1546,9 +1546,10 @@ export async function measureSleepingWorkers(caller: Caller): Promise<void> {
     });
   }
   // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
-  // authority and can terminalize a parked worker. `status` also calls this helper, so there is
-  // no later message/spawn acceptance barrier we can rely on: make every critical revision seen
-  // through the end of measurement durable before publishing the resulting state to the model.
+  // authority and can terminalize a parked worker. ChatGPT agents action=status also calls this
+  // helper; external workers_status is a synchronous stored projection and does not remeasure.
+  // A caller that remeasures cannot rely on a later message/spawn acceptance barrier: make every
+  // critical revision seen through measurement durable before publishing the resulting state.
   try {
     if (!(await persistCriticalSwarmNow())) {
       throw new Error('the broker has no immediate durable persistence sink');
