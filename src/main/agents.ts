@@ -1025,6 +1025,7 @@ function stageExternalInbox<T>(family: Family, proposals: Map<AgentMessage, Agen
       if (original.ackedAt === null && proposal.ackedAt !== null) prime.info.delivered++;
       Object.assign(original, proposal); externalInboxProposals.delete(original);
     }
+    if ([...proposals.values()].some(row => row.ackedAt !== null)) prime.queue = retainSettledTail(prime.queue);
     recount(prime); changed('telemetry');
   }, rollback: () => {
     if (settled) return; settled = true;
@@ -1072,7 +1073,7 @@ export function stageExternalAck(caller: ExternalCaller, args: AckArgs): StagedM
     if (row.ackedAt === null) {
       const now = Date.now();
       proposals.set(row, { ...row, ackedAt: now, externalDelivery: { ...row.externalDelivery, ackedAt: now } });
-    }
+    } else proposals.set(row, { ...row });
   }
   return stageExternalInbox(family, proposals, { request_id: args.request_id, family_id: args.family_id, acknowledged, status: 'accepted' });
 }
@@ -2535,13 +2536,16 @@ function assertRoom(to: Agent, incoming: number): void {
   }
 }
 
+/** Existing queue policy: retain every pending row and a settled tail after the threshold. */
+function retainSettledTail(queue: AgentMessage[]): AgentMessage[] {
+  if (queue.length <= MAX_QUEUE * 2) return queue;
+  return [...queue.filter(item => item.ackedAt !== null).slice(-MAX_QUEUE), ...queue.filter(item => item.ackedAt === null)];
+}
+
 function enqueue(to: Agent, message: AgentMessage): void {
   assertRoom(to, 1);
   to.queue.push(message);
-  if (to.queue.length > MAX_QUEUE * 2) {
-    const settled = to.queue.filter((item) => item.ackedAt !== null).slice(-MAX_QUEUE);
-    to.queue = [...settled, ...to.queue.filter((item) => item.ackedAt === null)];
-  }
+  to.queue = retainSettledTail(to.queue);
   recount(to);
 }
 
@@ -5295,8 +5299,10 @@ function serializeAgents(agents: Map<string, Agent>, includeUnpublished: boolean
         ).length;
         info.delivered += newlyDelivered;
       }
-      const projected = agent.queue.map(message => includeUnpublished ? externalInboxProposals.get(message) ?? message : message);
-      const newlyAcknowledged = includeUnpublished ? projected.filter((message, index) => agent.queue[index]!.ackedAt === null && message.ackedAt !== null).length : 0;
+      const proposals = agent.queue.map(message => includeUnpublished ? externalInboxProposals.get(message) ?? message : message);
+      const newlyAcknowledged = includeUnpublished ? proposals.filter((message, index) => agent.queue[index]!.ackedAt === null && message.ackedAt !== null).length : 0;
+      const externalAck = includeUnpublished && agent.queue.some(message => externalInboxProposals.get(message)?.ackedAt != null);
+      const projected = externalAck ? retainSettledTail(proposals) : proposals;
       info.delivered += newlyAcknowledged;
       const queue = projected
         .filter(

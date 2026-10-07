@@ -6,7 +6,7 @@ import * as broker from '../src/main/agents.js';
 import * as service from '../src/main/external-prime-service.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 import type { ExternalCaller } from '../src/shared/agent-owner.js';
-import { familyIdSchema, requestIdSchema } from '../src/shared/agent-owner.js';
+import { familyIdSchema, requestIdSchema, reportIdSchema, receiptIdSchema } from '../src/shared/agent-owner.js';
 import { initSessionStore, createSession, flushSessions, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { EXTERNAL_PRIME_LIMITS, externalResponseSchemas } from '../src/shared/external-prime.js';
 let dir: string, a: ExternalCaller, b: ExternalCaller;
@@ -166,4 +166,71 @@ it('replays durable receipts after family deletion and checks all normalized inp
   const input = args(); const receipt = await service.spawnExternal(a, { ...input, context: undefined }); broker.resetSwarm();
   expect(await service.spawnExternal(a, input)).toEqual(receipt); expect(browser).toHaveBeenCalledTimes(1);
   await expect(service.spawnExternal(a, { ...input, model: 'different' })).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+});
+
+function primeQueue() {
+  const snapshot = broker.snapshotSwarm()!;
+  return [...snapshot.activeRuns!, ...snapshot.dormantRuns!][0]!.agents.find(row => row.info.id === 'prime')!.queue;
+}
+it('bounds settled history through actual repeated finishes without any prime enqueue and replays pruned ACKs', async () => {
+  const spawned = await service.spawnExternal(a, args()); broker.bindConversation(spawned.worker_id, 'retained-worker', spawned.run_id);
+  let firstAck!: Parameters<typeof service.ackExternal>[1], firstReceipt!: Awaited<ReturnType<typeof service.ackExternal>>;
+  for (let i = 0; i < 402; i++) {
+    if (i > 0) {
+      await service.messageExternal(a, { request_id: requestIdSchema.parse(crypto.randomUUID()), family_id: spawned.family_id, worker_id: spawned.worker_id, message: 'next', resume: false });
+      const revival = broker.pendingWorkerRevivals().find(row => row.conversationId === 'retained-worker')!;
+      broker.noteWorkerRevived(spawned.worker_id, 'retained-worker', revival.messageIds, null, revival.runId);
+      broker.noteAgentAlive('retained-worker');
+      broker.acknowledgeOffersForConversation('retained-worker');
+    }
+    broker.finishAgent({ conversationId: 'retained-worker' }, `finish-${i}`);
+    const page = await service.reportsExternal(a, { family_id: spawned.family_id, limit: 10 });
+    const row = page.reports[0]!; const input = { request_id: requestIdSchema.parse(crypto.randomUUID()), family_id: spawned.family_id, receipts: [{ report_id: row.report_id, revision: row.revision, delivery_receipt_id: row.delivery_receipt_id }] };
+    const receipt = await service.ackExternal(a, input);
+    if (i === 0) { firstAck = input; firstReceipt = receipt; }
+  }
+  expect(primeQueue()).toHaveLength(201);
+  expect(primeQueue().some(row => row.externalReport?.id === firstAck.receipts[0]!.report_id)).toBe(false);
+  await service.messageExternal(a, { request_id: requestIdSchema.parse(crypto.randomUUID()), family_id: spawned.family_id, worker_id: spawned.worker_id, message: 'pending assignment', resume: false });
+  const revival = broker.pendingWorkerRevivals().find(row => row.conversationId === 'retained-worker')!;
+  broker.noteWorkerRevived(spawned.worker_id, 'retained-worker', revival.messageIds, null, revival.runId); broker.noteAgentAlive('retained-worker'); broker.acknowledgeOffersForConversation('retained-worker');
+  broker.finishAgent({ conversationId: 'retained-worker' }, 'new pending report');
+  const pending = await service.reportsExternal(a, { family_id: spawned.family_id, limit: 10 });
+  broker.restoreSwarm(broker.snapshotSwarm());
+  expect(await service.ackExternal(a, firstAck)).toEqual(firstReceipt);
+  expect(await service.reportsExternal(a, { family_id: spawned.family_id, limit: 10 })).toEqual(pending);
+  await expect(service.ackExternal(a, { ...firstAck, request_id: requestIdSchema.parse(crypto.randomUUID()) })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+});
+it.each([false, true])('prunes only a durable ACK projection, preserving pending reports across paused write failure=%s', async failWrite => {
+  const spawned = await service.spawnExternal(a, args()); broker.bindConversation(spawned.worker_id, 'threshold-worker', spawned.run_id); broker.finishAgent({ conversationId: 'threshold-worker' }, 'template');
+  await service.reportsExternal(a, { family_id: spawned.family_id, limit: 10 });
+  const snapshot = broker.snapshotSwarm()!; const family = snapshot.activeRuns![0]!; const prime = family.agents.find(row => row.info.id === 'prime')!; const template = prime.queue[0]!;
+  const settled = Array.from({ length: 400 }, (_, index) => {
+    const row = structuredClone(template); row.id = `old-${index}`; row.text = `settled-${index}`; row.externalReport!.id = reportIdSchema.parse(crypto.randomUUID());
+    row.externalDelivery!.id = receiptIdSchema.parse(crypto.randomUUID()); row.ackedAt = 123; row.externalDelivery!.ackedAt = 123; return row;
+  });
+  const pending = Array.from({ length: 3 }, (_, index) => {
+    const row = structuredClone(template); row.id = `pending-${index}`; row.text = `pending-${index}`; row.externalReport!.id = reportIdSchema.parse(crypto.randomUUID());
+    row.externalDelivery!.id = receiptIdSchema.parse(crypto.randomUUID()); return row;
+  });
+  prime.queue = [...settled, ...pending]; broker.restoreSwarm(snapshot); const before = structuredClone(primeQueue());
+  const row = pending[0]!; const input = { request_id: requestIdSchema.parse(crypto.randomUUID()), family_id: spawned.family_id, receipts: [{ report_id: row.externalReport!.id, revision: 1, delivery_receipt_id: row.externalDelivery!.id }] };
+  await expect(service.ackExternal(a, { ...input, receipts: [input.receipts[0]!, { report_id: pending[1]!.externalReport!.id, revision: 9, delivery_receipt_id: pending[1]!.externalDelivery!.id }] })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+  expect(primeQueue()).toEqual(before);
+  let finishWrite!: () => void, started!: () => void; let projected: typeof snapshot | null = null;
+  const ready = new Promise<void>(resolve => { started = resolve; }); const gate = new Promise<void>(resolve => { finishWrite = resolve; });
+  broker.onSwarmPersistNow(async value => { projected = value; started(); await gate; if (failWrite) throw new Error('disk'); });
+  const ack = service.ackExternal(a, input); const rejected = failWrite ? expect(ack).rejects.toMatchObject({ code: 'PERSISTENCE_FAILED' }) : null;
+  await ready;
+  expect(primeQueue()).toEqual(before);
+  finishWrite();
+  if (rejected) { await rejected; expect(primeQueue()).toEqual(before); expect(broker.getExternalReceipt(a, input.request_id)).toBeNull(); }
+  else {
+    await ack;
+    const saved = projected! as typeof snapshot; const savedQueue = [...saved.activeRuns!, ...saved.dormantRuns!][0]!.agents.find(item => item.info.id === 'prime')!.queue;
+    expect(primeQueue()).toEqual(savedQueue); expect(savedQueue).toHaveLength(202);
+    expect(savedQueue.filter(item => item.ackedAt === null).map(item => item.text)).toEqual(['pending-1', 'pending-2']);
+    broker.restoreSwarm(saved); expect(primeQueue()).toEqual(savedQueue);
+    expect(service.statusExternal(a, { request_id: input.request_id })).toMatchObject({ operation: 'workers_ack' });
+  }
 });

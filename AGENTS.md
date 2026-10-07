@@ -3010,6 +3010,12 @@ limits; both external list envelopes additionally fit 64 KiB of UTF-8 JSON inclu
 Long summaries carry an explicit shortening flag/marker within 4,000 characters; original inbox
 text is preserved, and a summary does not promise result-file retrieval. Report cursors become
 stale when their pending sequence/revisions change and require an explicit restart.
+ACK projection and successful commit reuse the existing queue history rule: above 400 total
+rows, retain every pending row and the latest 200 settled rows. This also bounds settled history
+from finish/lifecycle reports that bypass ordinary enqueue; pending completion is never refused
+or removed by this cleanup. Failed or pending ACK writes cannot prune live history. After an old
+settled row is pruned, its original mutation UUID still replays from the ledger; a fresh request
+for that removed delivery receipt receives the existing invalid-receipt refusal.
 
 Attached and detached workers share `WORKER_SILENCE_MS` (three minutes). Only accepted new
 assistant output, native work or exactly attributed tool activity renews this clock. Page
